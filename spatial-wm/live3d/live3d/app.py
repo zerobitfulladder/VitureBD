@@ -100,6 +100,10 @@ def main():
     ap.add_argument("--mode", choices=["flat", "depth"], default="flat")
     ap.add_argument("--trt", action="store_true", help="use TensorRT FP16 depth (DA2, fixed 392x686)")
     ap.add_argument("--panel", default=None, help="WxH override, e.g. 3840x1080")
+    ap.add_argument("--region", default=None,
+                    help="desktop capture rect 'X,Y,W,H' in root px. Default: the "
+                         "panel's left half. Point this at a separate output (e.g. "
+                         "the eDP head) to grab a real desktop with no stacking race.")
     ap.add_argument("--sync", action="store_true", help="compute depth inline (debug)")
     args = ap.parse_args()
 
@@ -108,11 +112,15 @@ def main():
         panel = tuple(int(v) for v in args.panel.split("x"))
 
     ov = Overlay(panel=panel)
-    region = (0, 0, ov.eye_w, ov.ph)
+    if args.region:
+        rx, ry, rw, rh = (int(v) for v in args.region.split(","))
+    else:
+        rx, ry, rw, rh = 0, 0, ov.eye_w, ov.ph   # legacy: left half of the panel
+    region = (rx, ry, rw, rh)
     print(f"[live3d] panel {ov.pw}x{ov.ph}  eye {ov.eye_w}x{ov.ph}  region {region}", flush=True)
 
     cap = DesktopCapture(ov.ctx, ov.x_display, ov.xid, region)
-    renderer = Renderer(ov.ctx, ov.pw, ov.ph, ov.eye_w, (ov.eye_w, ov.ph),
+    renderer = Renderer(ov.ctx, ov.pw, ov.ph, ov.eye_w, (rw, rh),
                         grid=args.grid, depth_h=args.depth_h)
     print("[live3d] loading depth model...", flush=True)
     depth = make_depth(args)

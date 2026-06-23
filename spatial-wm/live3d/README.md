@@ -1,9 +1,21 @@
-# live3d — live desktop → stereo 3D (single display, glasses-only)
+# live3d — live desktop → stereo 3D
 
 Captures the desktop, estimates monocular depth (Depth Anything V2 Small),
 mesh-warps it to a stereo pair, and presents SBS fullscreen on the glasses — all
-live. Single-display, no feedback loop (window-pixmap capture, not screen-grab).
-Replaces the SBS-passthrough stereo-mirror.
+live. No feedback loop (window-pixmap capture, not screen-grab). Replaces the
+SBS-passthrough stereo-mirror.
+
+## Display heads
+
+By default the desktop is rendered on a **separate head** — the eDP laptop panel,
+which the NVIDIA GPU drives directly in EnvyControl nvidia-mode — and live3d
+grabs windows from there while its overlay owns the glasses (DP-0). Because the
+rendered desktop and the overlay are on different physical outputs, a window
+going fullscreen can't restack above the overlay: **no stacking race.** `run.sh`
+enables the eDP head, moves qtile's desktop onto it (`detect_screens`), and turns
+it back off on exit. `--no-edp` falls back to the legacy single-display mode
+(capture the glasses' own left 1920×1080), where the overlay keeps itself raised
+above fullscreen windows.
 
 ## Architecture (hybrid: C++ capture + Python app)
 
