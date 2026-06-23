@@ -108,6 +108,25 @@ out vec4 f;
 void main() { f = vec4(col, 1.0); }
 """
 
+# SSAA resolve: 4-tap box downsample of the supersampled present buffer. Each tap
+# is itself bilinear, so this averages the warped silhouette across sub-pixels —
+# smooths the depth-edge "ladder" that finer tessellation only shrinks.
+RESOLVE_FS = """
+#version 330
+in vec2 v_uv;
+uniform sampler2D src;
+uniform vec2 texel;     // 1 / supersampled size
+out vec4 f;
+void main() {
+    vec2 o = texel * 0.5;
+    vec3 c = texture(src, v_uv + vec2(-o.x, -o.y)).rgb
+           + texture(src, v_uv + vec2( o.x, -o.y)).rgb
+           + texture(src, v_uv + vec2(-o.x,  o.y)).rgb
+           + texture(src, v_uv + vec2( o.x,  o.y)).rgb;
+    f = vec4(c * 0.25, 1.0);
+}
+"""
+
 
 def _grid(gx, gy):
     xs = np.linspace(0, 1, gx + 1, dtype="f4")
@@ -122,11 +141,12 @@ def _grid(gx, gy):
 
 
 class Renderer:
-    def __init__(self, ctx, pw, ph, eye_w, region, grid=256, depth_h=392):
+    def __init__(self, ctx, pw, ph, eye_w, region, grid=256, depth_h=392, ss=1.0):
         self.ctx = ctx
         self.pw, self.ph, self.eye_w = pw, ph, eye_w
         self.rw, self.rh = region
         self.eye_h = ph
+        self.ss = max(1.0, float(ss))   # present supersampling factor (1.0 = off)
 
         # work-area RT (composited desktop), v=1 = top
         self.work = ctx.framebuffer(color_attachments=[ctx.texture((self.rw, self.rh), 3)])
@@ -190,6 +210,20 @@ class Renderer:
         self.cursor_vao = ctx.vertex_array(self.cursor, [(ctx.buffer(ctri.tobytes()), "2f", "in_p")])
         self.aspect = eye_w / ph
 
+        # SSAA present buffer: render the warp + cursor at ss x panel res into an
+        # offscreen RT, then box-downsample to the screen (see RESOLVE_FS).
+        self.ss_fbo = None
+        if self.ss > 1.0:
+            sw, sh = int(round(pw * self.ss)), int(round(ph * self.ss))
+            self.ss_tex = ctx.texture((sw, sh), 3)
+            self.ss_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.ss_fbo = ctx.framebuffer(color_attachments=[self.ss_tex])
+            self.resolve = ctx.program(vertex_shader=BLIT_VS, fragment_shader=RESOLVE_FS)
+            self.resolve["src"] = 0
+            self.resolve["texel"].value = (1.0 / sw, 1.0 / sh)
+            self.resolve_vao = ctx.vertex_array(
+                self.resolve, [(ctx.buffer(unit.tobytes()), "2f", "in_uv")])
+
     # --- desktop compositing -------------------------------------------------
     def composite(self, windows):
         self.work.use()
@@ -249,7 +283,10 @@ class Renderer:
     # --- present -------------------------------------------------------------
     def draw(self, sbs_disp, conv, zoom, panx, pany, pointer=None):
         ctx = self.ctx
-        ctx.screen.use()
+        # Render the warp (and cursor) into the supersampled RT when SSAA is on,
+        # then box-downsample to the screen; otherwise draw straight to screen.
+        target = self.ss_fbo if self.ss_fbo is not None else ctx.screen
+        target.use()
         ctx.clear(0.0, 0.0, 0.0)
         self.work.color_attachments[0].use(0)
         self.depth_tex.use(1)
@@ -258,18 +295,24 @@ class Renderer:
         pan_ndc = (panx / self.eye_w * 2.0, -pany / self.ph * 2.0)
         self.warp["pan"].value = pan_ndc
         disp_ndc = sbs_disp / (self.eye_w / 2.0)
+        s = self.ss
+        ew, eh = int(round(self.eye_w * s)), int(round(self.ph * s))
         # Per-eye viewport already confines rendering (NDC clips to the viewport
         # rect), so no scissor needed.
         for half in range(2):
-            x0 = half * self.eye_w
-            ctx.viewport = (x0, 0, self.eye_w, self.ph)
+            ctx.viewport = (half * ew, 0, ew, eh)
             self.warp["eye_sign"].value = 1.0 if half == 0 else -1.0
             self.warp["disp"].value = disp_ndc
             self.warp_vao.render(moderngl.TRIANGLES)
         if pointer is not None and pointer[2]:
-            self._draw_cursor(pointer, disp_ndc, conv, zoom, pan_ndc)
+            self._draw_cursor(pointer, disp_ndc, conv, zoom, pan_ndc, ew, eh)
+        if self.ss_fbo is not None:
+            ctx.screen.use()
+            ctx.viewport = (0, 0, self.pw, self.ph)
+            self.ss_tex.use(0)
+            self.resolve_vao.render(moderngl.TRIANGLES)
 
-    def _draw_cursor(self, pointer, disp_ndc, conv, zoom, pan_ndc):
+    def _draw_cursor(self, pointer, disp_ndc, conv, zoom, pan_ndc, ew, eh):
         ctx = self.ctx
         u, v = pointer[0], pointer[1]
         bx = (u * 2 - 1) * zoom + pan_ndc[0]
@@ -279,7 +322,7 @@ class Renderer:
         cdisp = 0.004 if disp_ndc > 0 else 0.0
         asp = self.aspect
         for half in range(2):
-            ctx.viewport = (half * self.eye_w, 0, self.eye_w, self.ph)
+            ctx.viewport = (half * ew, 0, ew, eh)
             cx = bx + (1.0 if half == 0 else -1.0) * cdisp
             self.cursor["center"].value = (cx, by)
             # black outline (slightly larger), then green fill

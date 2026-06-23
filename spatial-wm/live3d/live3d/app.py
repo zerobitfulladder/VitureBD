@@ -97,6 +97,9 @@ def main():
     ap.add_argument("--disp", type=float, default=18.0, help="max disparity px (3D strength)")
     ap.add_argument("--conv", type=float, default=0.5, help="convergence depth 0..1")
     ap.add_argument("--grid", type=int, default=256)
+    ap.add_argument("--ss", type=float, default=1.0,
+                    help="present supersampling factor (e.g. 2.0) — antialiases the "
+                         "depth-edge ladder. 1.0 = off. Costs ~ss^2 present fragments.")
     ap.add_argument("--mode", choices=["flat", "depth"], default="flat")
     ap.add_argument("--trt", action="store_true", help="use TensorRT FP16 depth (DA2, fixed 392x686)")
     ap.add_argument("--panel", default=None, help="WxH override, e.g. 3840x1080")
@@ -121,7 +124,7 @@ def main():
 
     cap = DesktopCapture(ov.ctx, ov.x_display, ov.xid, region)
     renderer = Renderer(ov.ctx, ov.pw, ov.ph, ov.eye_w, (rw, rh),
-                        grid=args.grid, depth_h=args.depth_h)
+                        grid=args.grid, depth_h=args.depth_h, ss=args.ss)
     print("[live3d] loading depth model...", flush=True)
     depth = make_depth(args)
     controls = Controls()
