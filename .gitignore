@@ -1,0 +1,43 @@
+# --- third-party / vendored (own git, multi-GB) ---
+/nunif/
+
+# --- media assets ---
+/video/
+*.mp4
+*.webm
+*.mkv
+*.mov
+
+# --- vendored prebuilt SDK binaries ---
+/x86_64/
+/demo/glasses-demo
+*.zip
+
+# --- python envs / caches ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# --- C/C++ build output ---
+build/
+*.o
+*.a
+*.so
+*.so.*
+
+# --- model weights / engines ---
+*.onnx
+*.engine
+*.pth
+*.pt
+*.safetensors
+*.trt
+
+# --- runtime state / scratch ---
+*.log
+live3d_grab.png
+
+# stray compiled probe binary
+/spatial-wm/probe/capture_probe
