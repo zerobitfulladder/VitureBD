@@ -1,13 +1,3 @@
-# --- third-party / vendored (own git, multi-GB) ---
-/nunif/
-
-# --- media assets ---
-/video/
-*.mp4
-*.webm
-*.mkv
-*.mov
-
 # --- vendored prebuilt SDK binaries ---
 /x86_64/
 /demo/glasses-demo
@@ -37,7 +27,5 @@ build/
 
 # --- runtime state / scratch ---
 *.log
-live3d_grab.png
-
-# stray compiled probe binary
-/spatial-wm/probe/capture_probe
+# project-local runtime config (auto-generated: profiles.json, state.json)
+/wreath/braindance/config/

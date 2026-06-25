@@ -40,7 +40,7 @@ depth refreshes at ~30–40fps.
 # one-time: build the capture lib
 cd capture && cmake -S . -B build && cmake --build build -j && cd ..
 
-# run (glasses in 3D mode first); uses the nunif venv
+# run (glasses in 3D mode first); uses the local .venv (torch + tensorrt)
 ./run.sh                  # starts FLAT; toggle to DEPTH with the side button
 ./run.sh --mode depth     # start in DEPTH
 ```
