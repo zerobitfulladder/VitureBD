@@ -29,3 +29,12 @@ build/
 *.log
 # project-local runtime config (auto-generated: profiles.json, state.json)
 /wreath/braindance/config/
+
+# --- VITURE SDK and its demo: copyright VITURE Inc., not redistributable ---
+# Keep them on disk to build kiroshi; they never go into git.
+/include/
+/wreath/kiroshi/*
+!/wreath/kiroshi/window_capture.cpp
+!/wreath/kiroshi/window_capture.h
+!/wreath/kiroshi/scene_window.h
+!/wreath/kiroshi/README.md
