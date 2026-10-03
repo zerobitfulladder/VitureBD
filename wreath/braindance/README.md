@@ -45,6 +45,19 @@ cd capture && cmake -S . -B build && cmake --build build -j && cd ..
 ./run.sh --mode depth     # start in DEPTH
 ```
 
+## Settings panel
+
+Everything is tuned live from a panel drawn inside the glasses (Tab / Shift+Tab
+switch tabs, arrows change values, settings persist to `config/state.json`).
+The images below are rendered offscreen from the real menu and a saved
+configuration by [`docs/render_panel.py`](docs/render_panel.py):
+
+| | |
+|---|---|
+| ![DISPLAY tab](docs/panel-0-display.png) | ![DEPTH tab](docs/panel-1-depth.png) |
+| ![3D tab](docs/panel-2-3d.png) | ![TEAR tab](docs/panel-3-tear.png) |
+| ![REFINE tab](docs/panel-4-refine.png) | ![DEBUG tab](docs/panel-5-debug.png) |
+
 ## Controls (hold **Super+Alt**)
 
 | Input | Action |
