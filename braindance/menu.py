@@ -1,12 +1,14 @@
-"""menu.py — a small keyboard-driven settings menu (no GL, no mouse).
+"""menu.py — the settings menu's model (no GL, no input handling).
 
-Settings are grouped into Tabs (switched with Tab / Shift+Tab). Within a tab,
-items are either a Section (a non-selectable subheader) or a Setting (a typed
-value: float / int / bool / enum) with get/set closures over the app's state.
-Settings may carry a `visible` predicate so context-dependent knobs (e.g. JBU vs
-guided-filter options) appear only when relevant, and a `help` one-liner shown in
-the info pane. Up/Down move over the visible editable rows of the current tab;
-Left/Right adjust; Tab/Shift+Tab change tab; the app dismisses on Enter.
+Settings are grouped into Tabs. Within a tab, items are either a Section (a
+non-selectable subheader) or a Setting (a typed value: num / bool / enum, with
+get/set closures over the app's state, or an action). Settings and tabs may
+carry a `visible` predicate so context-dependent knobs (e.g. JBU vs guided-
+filter options, or everything that only means something in 3D) appear only
+when relevant.
+
+It is driven by row: the session maps the pointer to a row of rows() and
+hovers it (the selected row), clicks it, or steps it up and down.
 """
 
 
@@ -22,15 +24,17 @@ class Setting:
     is_section = False
 
     def __init__(self, label, kind, get, set, *, step=1, lo=None, hi=None,
-                 options=None, fmt=None, editable=True, visible=None, help=""):
+                 options=None, fmt=None, editable=True, visible=None, on_click=None,
+                 help=""):
         self.label = label
-        self.kind = kind            # 'num' | 'bool' | 'enum'
+        self.kind = kind            # 'num' | 'bool' | 'enum' | 'action'
         self._get, self._set = get, set
         self.step, self.lo, self.hi = step, lo, hi
         self.options = options or []
         self._fmt = fmt
         self.editable = editable
         self._visible = visible     # None => always visible
+        self.on_click = on_click    # replaces the click's toggle / next (apply, act)
         self.help = help
 
     @property
@@ -53,9 +57,16 @@ class Setting:
             return f"{v:.2f}"
         return str(v)
 
+    def click(self):
+        """Its on_click if it has one; else a bool toggles and an enum steps on."""
+        if self.on_click is not None:
+            self.on_click()
+        elif self.kind in ("bool", "enum"):
+            self.adjust(+1)
+
     def adjust(self, direction):
-        """direction: -1 (Left) or +1 (Right). Returns True if the value changed."""
-        if not self.editable:
+        """One step: -1 down, +1 up. Returns True if the value changed."""
+        if not self.editable or self.kind == "action":
             return False
         v = self._get()
         if self.kind == "bool":
@@ -78,9 +89,14 @@ class Setting:
 
 
 class Tab:
-    def __init__(self, name, items):
+    def __init__(self, name, items, visible=None):
         self.name = name
         self.items = items          # Section | Setting, in display order
+        self._visible = visible     # None => always visible
+
+    @property
+    def visible(self):
+        return self._visible is None or bool(self._visible())
 
 
 class Menu:
@@ -89,9 +105,14 @@ class Menu:
         self.t = 0                  # current tab index
         self._sel = 0               # selection within the current tab's nav list
 
+    def _tabs(self):
+        return [tab for tab in self.tabs if tab.visible]
+
     @property
     def tab(self):
-        return self.tabs[self.t]
+        tabs = self._tabs()
+        self.t = min(self.t, len(tabs) - 1)        # clamp if tabs hid out
+        return tabs[self.t]
 
     def _nav(self):
         """Visible, editable settings in the current tab — where the cursor lands."""
@@ -107,34 +128,47 @@ class Menu:
         return nav[self._sel]
 
     def next_tab(self):
-        self.t = (self.t + 1) % len(self.tabs)
+        self.t = (self.t + 1) % len(self._tabs())
         self._sel = 0
 
     def prev_tab(self):
-        self.t = (self.t - 1) % len(self.tabs)
+        self.t = (self.t - 1) % len(self._tabs())
         self._sel = 0
 
-    def up(self):
-        nav = self._nav()
-        if nav:
-            self._sel = (min(self._sel, len(nav) - 1) - 1) % len(nav)
+    def select_tab(self, i):
+        self.t = i % len(self._tabs())
+        self._sel = 0
 
-    def down(self):
-        nav = self._nav()
-        if nav:
-            self._sel = (min(self._sel, len(nav) - 1) + 1) % len(nav)
+    def _row_items(self):
+        """The items rows() shows, in order."""
+        return [it for it in self.tab.items if it.is_section or it.visible]
 
-    def left(self):
-        c = self.current
-        return c.adjust(-1) if c else False
+    def _row(self, i):
+        """rows()[i]'s setting, selected; None for a section."""
+        items = self._row_items()
+        it = items[i] if 0 <= i < len(items) else None
+        if it is None or it.is_section or not it.editable:
+            return None
+        self._sel = self._nav().index(it)
+        return it
 
-    def right(self):
-        c = self.current
-        return c.adjust(+1) if c else False
+    def hover(self, i):
+        self._row(i)
+
+    def click(self, i):
+        it = self._row(i)
+        if it is not None:
+            it.click()
+
+    def step(self, i, direction):
+        it = self._row(i)
+        if it is not None:
+            it.adjust(direction)
 
     def tab_bar(self):
-        """(names, current_index) for the renderer's tab strip."""
-        return [t.name for t in self.tabs], self.t
+        """(names, current_index) for the panel's tab strip."""
+        tab = self.tab
+        return [t.name for t in self._tabs()], self._tabs().index(tab)
 
     def rows(self):
         """Rows of the CURRENT tab only (sections + visible settings)."""

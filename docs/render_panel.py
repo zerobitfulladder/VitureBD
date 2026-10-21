@@ -1,71 +1,56 @@
 """Render braindance's in-glasses settings panel offscreen, one PNG per tab.
 
-Uses the real menu definition (the block in app.py, executed as written), the
-saved settings in config/state.json, and Renderer.set_panel itself. Only the GL
-texture upload is replaced by a capture of the PIL image, so no window, GPU
-context or glasses are needed.
+Uses the real menu (settings.build_menu) over the default settings, and the
+real panel bitmap (panel.paint), so no window, GPU context or glasses are
+needed. Each tab is shown where it appears: the live desktop's tabs in a 3D
+mode with the mesh warp (so EDGES and REFINE show), SPACE in a 2D mode with
+the desktop anchored, MODEL while a model is open.
 
-    cd wreath/braindance && .venv/bin/python docs/render_panel.py docs
+    uv run docs/render_panel.py docs
 """
-import json
 import os
 import sys
-import textwrap
 from types import SimpleNamespace
 
-ROOT = os.path.expanduser("~/Projects/VitureBD/wreath/braindance")
+from PIL import Image
+
+from braindance import panel, settings
+from braindance.glasses import modes
+from braindance.menu import Section, Setting
+
 OUT = sys.argv[1]
-sys.path.insert(0, ROOT)
-
-from PIL import Image, ImageFont  # noqa: E402
-
-from braindance.depth import registry  # noqa: E402
-from braindance.menu import Menu, Section, Setting, Tab  # noqa: E402
-from braindance.render import Renderer  # noqa: E402
-
-saved = json.load(open(os.path.join(ROOT, "config", "state.json")))
-S = SimpleNamespace(
-    mode=saved["mode"], model=saved["model"], trt=bool(saved["trt"]),
-    sync=bool(saved["sync"]), ema=float(saved["ema"]), disp=float(saved["disp"]),
-    screen_depth=float(saved["screen_depth"]), climit=float(saved["climit"]),
-    zoom=float(saved["zoom"]), ss=float(saved["ss"]), tear=bool(saved["tear"]),
-    tear_thresh=float(saved["tear_thresh"]), tear_fill=saved["tear_fill"],
-    sharp_mode=saved["sharp_mode"], jbu_color=float(saved["jbu_color"]),
-    jbu_reach=float(saved["jbu_reach"]), jbu_depth=float(saved["jbu_depth"]),
-    gf_eps=float(saved["gf_eps"]), gf_radius=int(saved["gf_radius"]),
-    tear_debug=False, depth_view="off",
-)
-
-# The menu block from app.py, executed as written.
-src = open(os.path.join(ROOT, "braindance", "app.py")).read().splitlines()
-start = next(i for i, l in enumerate(src) if l.strip().startswith("model_opts = "))
-end = next(i for i in range(start, len(src)) if src[i] == "    ])")
-ns = dict(S=S, registry=registry, Menu=Menu, Setting=Setting, Section=Section, Tab=Tab)
-exec(textwrap.dedent("\n".join(src[start:end + 1])), ns)
-menu = ns["menu"]
 
 
-class Capture:
-    def write(self, data):
-        self.image = Image.frombytes("RGBA", (r.PANEL_W, r.PANEL_H), data)
+def glasses(mode):
+    return [
+        Section("DISPLAY MODE"),
+        Setting("OUTPUT", "enum", lambda: mode.name, lambda v: None,
+                options=[m.name for m in modes.MODES], fmt=str.upper),
+        Section("SESSION"),
+        Setting("END SESSION", "action", lambda: None, None, fmt=lambda v: "CLICK"),
+    ]
 
 
-r = Renderer.__new__(Renderer)
-r.PANEL_W, r.PANEL_H = 640, 436
-r.pfont = ImageFont.truetype("DejaVuSansMono.ttf", 21)
-r.pfont_b = ImageFont.truetype("DejaVuSansMono-Bold.ttf", 26)
-r.pfont_s = ImageFont.truetype("DejaVuSansMono.ttf", 16)
-r._panel_sig = None
-r.panel_tex = Capture()
-
-names, _ = menu.tab_bar()
-for i in range(len(names)):
-    tab_names, ti = menu.tab_bar()
-    r._panel_sig = None
-    r.set_panel(tab_names, ti, menu.rows(), 60)
+def save(menu, tab, fps, status):
+    menu.select_tab(menu.tab_bar()[0].index(tab))
+    img, _ = panel.paint(*menu.tab_bar(), menu.rows(), fps=fps, status=status)
     # the panel is translucent over the scene: show it over the dark ground it floats on
-    ground = Image.new("RGBA", r.panel_tex.image.size, (6, 4, 14, 255))
-    Image.alpha_composite(ground, r.panel_tex.image).convert("RGB").save(
-        os.path.join(OUT, f"panel-{ti}-{tab_names[ti].lower()}.png"))
-    print("tab", ti, tab_names[ti], len(menu.rows()), "rows")
-    menu.next_tab()
+    ground = Image.new("RGBA", img.size, (6, 4, 14, 255))
+    Image.alpha_composite(ground, img).convert("RGB").save(
+        os.path.join(OUT, f"panel-{tab.lower()}.png"))
+    print(f"{tab}: {len(menu.rows())} rows")
+
+
+S = SimpleNamespace(**settings.DEFAULTS, fill_debug=False, depth_view="off")
+S.live3d, S.warp = True, "mesh"
+desktop = settings.build_menu(S, glasses(modes.by_name("3d-1080p60")), lambda: True,
+                              lambda: None, lambda: False)
+for tab in desktop.tab_bar()[0]:
+    save(desktop, tab, 60, ("DEPTH", "20/s"))
+
+S2 = SimpleNamespace(**vars(S))
+S2.space_mode = "anchor"
+save(settings.build_menu(S2, glasses(modes.by_name("2d-1080p120")), lambda: False,
+                         lambda: None, lambda: False), "SPACE", 120, ("TRACK", "6DOF"))
+save(settings.build_menu(S, glasses(modes.by_name("3d-1200p90")), lambda: True,
+                         lambda: None, lambda: True), "MODEL", 90, None)
