@@ -1,8 +1,3 @@
-# --- vendored prebuilt SDK binaries ---
-/x86_64/
-/demo/glasses-demo
-*.zip
-
 # --- python envs / caches ---
 .venv/
 venv/
@@ -28,13 +23,18 @@ build/
 # --- runtime state / scratch ---
 *.log
 # project-local runtime config (auto-generated: profiles.json, state.json)
-/wreath/braindance/config/
+/config/
 
-# --- VITURE SDK and its demo: copyright VITURE Inc., not redistributable ---
-# Keep them on disk to build kiroshi; they never go into git.
-/include/
-/wreath/kiroshi/*
-!/wreath/kiroshi/window_capture.cpp
-!/wreath/kiroshi/window_capture.h
-!/wreath/kiroshi/scene_window.h
-!/wreath/kiroshi/README.md
+# --- VITURE SDK (headers, libs, docs, demo): copyright VITURE Inc., not
+# redistributable. Unzip it into viture-sdk/; it never goes into git.
+/viture-sdk/
+
+# --- local tutorial (docs/tutorial/): kept out of git on purpose ---
+/docs/tutorial/
+
+# --- sample 3D models (braindance view): others' work under their own licenses.
+# Only the one whose license allows sharing (CC BY-NC 4.0, credited in the
+# README) is in git; anything else you put here stays out. ---
+/samples/*
+!/samples/floral_woman.glb
+!/samples/floral_woman-license.txt
