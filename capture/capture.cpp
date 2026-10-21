@@ -1,12 +1,13 @@
-// capture.cpp — see capture.h. Pure X11/GLX/GL, no glfw/raylib. The caller owns
-// the Display and GL context. Adapted from stereo-mirror's window_capture.cpp,
-// reduced to the capture core (overlay/input/cursor are the caller's job).
+// capture.cpp — see capture.h. Pure X11/GLX/GL, no glfw. The caller owns the
+// Display and GL context.
 
 #include "capture.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/Xcomposite.h>
+#include <X11/extensions/Xfixes.h>
+#include <X11/extensions/shape.h>
 #include <GL/gl.h>
 #include <GL/glx.h>
 
@@ -34,8 +35,11 @@ struct Cap {
 static Display *dpy        = nullptr;
 static Window   root       = 0;
 static Window   self_win   = 0;
+static Window   cow        = 0;     // the Composite overlay window, while we hold it
 static bool     live       = false;
 static bool     redirected = false;
+
+static PointerBarrier barriers[4]; static int nbarriers = 0;
 
 static int rx = 0, ry = 0, rw = 0, rh = 0;
 
@@ -133,6 +137,25 @@ static void drop_cap(int idx)
     caps[idx] = caps[--ncaps];
 }
 
+// Keep the pointer inside the region: a barrier on every region edge that is
+// not also a screen edge (the screen edge already stops it).
+static void put_up_barriers()
+{
+    int sw = DisplayWidth(dpy, DefaultScreen(dpy)), sh = DisplayHeight(dpy, DefaultScreen(dpy));
+    int x0 = rx, y0 = ry, x1 = rx + rw, y1 = ry + rh;
+    int edges[4][4] = { {x1, y0, x1, y1}, {x0, y0, x0, y1}, {x0, y1, x1, y1}, {x0, y0, x1, y0} };
+    bool inside[4]  = { x1 < sw, x0 > 0, y1 < sh, y0 > 0 };
+    for (int i = 0; i < 4; i++)
+        if (inside[i])
+            barriers[nbarriers++] = XFixesCreatePointerBarrier(
+                dpy, root, edges[i][0], edges[i][1], edges[i][2], edges[i][3], 0, 0, nullptr);
+
+    Window rr, cr; int px, py, wx, wy; unsigned int mask;
+    if (XQueryPointer(dpy, root, &rr, &cr, &px, &py, &wx, &wy, &mask) &&
+        (px < x0 || py < y0 || px >= x1 || py >= y1))
+        XWarpPointer(dpy, None, root, 0, 0, 0, 0, x0 + rw / 2, y0 + rh / 2);
+}
+
 int cap_init(void *display, unsigned long self_xid, int x, int y, int w, int h)
 {
     dpy = (Display *)display;
@@ -141,25 +164,46 @@ int cap_init(void *display, unsigned long self_xid, int x, int y, int w, int h)
     self_win = (Window)self_xid;
     rx = x; ry = y; rw = w; rh = h;
 
-    int evb, erb;
+    int evb, erb, fmaj = 5, fmin = 0;
     if (!XCompositeQueryExtension(dpy, &evb, &erb)) { fprintf(stderr, "[cap] no Composite\n"); return 0; }
+    if (!XFixesQueryExtension(dpy, &evb, &erb) || !XFixesQueryVersion(dpy, &fmaj, &fmin) || fmaj < 5) {
+        fprintf(stderr, "[cap] need XFixes 5 (pointer barriers)\n"); return 0;
+    }
     p_bind    = (PFNBindTexImageEXT)    glXGetProcAddress((const GLubyte *)"glXBindTexImageEXT");
     p_release = (PFNReleaseTexImageEXT) glXGetProcAddress((const GLubyte *)"glXReleaseTexImageEXT");
     if (!p_bind || !p_release) { fprintf(stderr, "[cap] no glXBindTexImageEXT\n"); return 0; }
-
-    XSetErrorHandler(err_handler);
-
-    g_err = 0;
-    XCompositeRedirectSubwindows(dpy, root, CompositeRedirectAutomatic);
-    XSync(dpy, False);
-    if (g_err) { fprintf(stderr, "[cap] RedirectSubwindows failed (%d) — picom running?\n", g_err); return 0; }
-    redirected = true;
-
     gather_candidates();
     if (ncand == 0) { fprintf(stderr, "[cap] no tfp FBConfigs\n"); return 0; }
 
+    XSetErrorHandler(err_handler);
+
+    // Our window goes inside the overlay window, above every other window, and
+    // both let input fall through to the windows they cover. It moves before
+    // the redirect, which would otherwise take it too as a child of the root.
+    cow = XCompositeGetOverlayWindow(dpy, root);
+    XserverRegion none = XFixesCreateRegion(dpy, nullptr, 0);
+    XFixesSetWindowShapeRegion(dpy, cow, ShapeInput, 0, 0, none);
+    XFixesSetWindowShapeRegion(dpy, self_win, ShapeInput, 0, 0, none);
+    XFixesDestroyRegion(dpy, none);
+    XReparentWindow(dpy, self_win, cow, 0, 0);
+    XMapWindow(dpy, self_win);
+
+    // Manual: X stops painting the windows at all; only we put pixels on screen.
+    g_err = 0;
+    XCompositeRedirectSubwindows(dpy, root, CompositeRedirectManual);
+    XSync(dpy, False);
+    if (g_err) {
+        fprintf(stderr, "[cap] RedirectSubwindows failed (%d): another compositor running?\n", g_err);
+        XCompositeReleaseOverlayWindow(dpy, root);
+        cow = 0;
+        return 0;
+    }
+    redirected = true;
+    put_up_barriers();
+    XSync(dpy, False);
+
     live = true;
-    fprintf(stderr, "[cap] active; region %dx%d+%d+%d, exclude 0x%lx\n", rw, rh, rx, ry, self_win);
+    fprintf(stderr, "[cap] active; region %dx%d+%d+%d\n", rw, rh, rx, ry);
     return 1;
 }
 
@@ -174,7 +218,7 @@ void cap_update()
 
     for (unsigned int i = 0; i < nch && npub < MAXWINS; i++) {
         Window w = children[i];
-        if (w == self_win) continue;
+        if (w == self_win || w == cow) continue;
         XWindowAttributes wa;
         g_err = 0;
         if (!XGetWindowAttributes(dpy, w, &wa) || g_err) continue;
@@ -224,7 +268,16 @@ void cap_shutdown()
 {
     if (!dpy) return;
     for (int i = ncaps - 1; i >= 0; i--) drop_cap(i);
-    if (redirected) XCompositeUnredirectSubwindows(dpy, root, CompositeRedirectAutomatic);
+    for (int i = 0; i < nbarriers; i++) XFixesDestroyPointerBarrier(dpy, barriers[i]);
+    nbarriers = 0;
+    if (redirected) XCompositeUnredirectSubwindows(dpy, root, CompositeRedirectManual);
+    redirected = false;
+    if (cow) {
+        XUnmapWindow(dpy, self_win);
+        XReparentWindow(dpy, self_win, root, 0, 0);
+        XCompositeReleaseOverlayWindow(dpy, root);
+        cow = 0;
+    }
     XSync(dpy, False);
     live = false;
     dpy = nullptr;

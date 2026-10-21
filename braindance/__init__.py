@@ -1,6 +1,9 @@
-"""braindance — live desktop → stereo 3D for the Viture glasses (single display).
+"""braindance — the desktop on VITURE glasses.
 
-Captures the desktop (window-pixmap, via the C++ libdesktopcapture), estimates
-monocular depth (Depth Anything V2), mesh-warps to a stereo pair, and presents
-SBS fullscreen on the glasses. See README.md for architecture.
+A session (session.py) owns the glasses and the X outputs: it lights the
+glasses alone, switches their display modes through VITURE's SDK (glasses/),
+and puts everything back when it ends or the glasses are unplugged. In 3D the
+live desktop (desktop.py, capture.py, depth.py, stereo.py, render.py) captures
+the desktop window by window, estimates depth, and warps a view for each eye;
+the player (media.py) shows 3D videos instead.
 """

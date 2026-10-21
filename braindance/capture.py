@@ -1,9 +1,9 @@
-"""capture.py — ctypes bridge to libdesktopcapture.so.
+"""capture.py — ctypes bridge to libdesktopcapture.so (capture/).
 
-Becomes the compositor, captures each top-level window's backing pixmap as a GL
-texture (in the overlay's GL context), and wraps those raw GL texture names as
-moderngl external textures so render.py can composite them. No screen-grab, so
-no capture/display feedback on a single display.
+Becomes the compositor: takes over the screen with the caller's window, and
+captures each top-level window's backing pixmap as a GL texture in that
+window's context, wrapped as a moderngl external texture so render.py can
+composite them. No screen-grab, so no capture/display feedback.
 """
 import ctypes
 import os
@@ -37,7 +37,7 @@ class DesktopCapture:
         self.rx, self.ry, self.rw, self.rh = region
         if not lib.cap_init(ctypes.c_void_p(int(x_display)), ctypes.c_ulong(int(self_xid)),
                             self.rx, self.ry, self.rw, self.rh):
-            raise RuntimeError("cap_init failed — is picom stopped?")
+            raise RuntimeError("cap_init failed: is another compositor running?")
         self._ext = {}   # GL texture name -> (moderngl external texture, (w, h))
 
     def update(self):

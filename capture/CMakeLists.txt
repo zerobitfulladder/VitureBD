@@ -9,5 +9,5 @@ add_library(desktopcapture SHARED capture.cpp)
 
 find_package(X11 REQUIRED)
 target_link_libraries(desktopcapture PRIVATE
-    ${X11_LIBRARIES} ${X11_Xcomposite_LIB} GL)
+    ${X11_LIBRARIES} ${X11_Xcomposite_LIB} ${X11_Xfixes_LIB} GL)
 target_include_directories(desktopcapture PRIVATE ${X11_INCLUDE_DIR})
