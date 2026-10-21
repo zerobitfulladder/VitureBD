@@ -1,14 +1,16 @@
-"""glcuda.py — zero-copy GL<->CUDA interop for the depth path.
+"""glcuda.py — zero-copy GL<->CUDA interop, for the depth path and the
+Gaussian splats' depth order.
 
-The sync depth path otherwise round-trips GPU->CPU->GPU twice: the composited
-depth-source is read back to a numpy frame and re-uploaded into torch, and the
-depth result is `.cpu()`d and re-uploaded into a GL texture. That readback also
-*stalls* the pipeline. This module registers the GL textures with CUDA so the
-frame is read straight into a torch tensor and the depth written straight back to
-a GL texture — no CPU, no stall.
+Without it the depth path round-trips GPU->CPU->GPU twice: the composited frame
+is read back to a numpy array and re-uploaded into torch, and the depth and the
+stereo offsets are `.cpu()`d and re-uploaded into GL textures. That readback
+also *stalls* the pipeline. This module registers the GL textures with CUDA so
+the frame is read straight into a torch tensor and the results written straight
+back to GL textures — no CPU, no stall.
 
-Requires the GL context current on the calling thread (so: the sync/main-thread
-depth path). cuda-python (`cuda.bindings`) does the registration/copy; torch owns
+Requires the GL context current on the calling thread (the main thread). The
+tensors written may come from another thread, once that thread has synchronized
+its stream. cuda-python (`cuda.bindings`) does the registration/copy; torch owns
 the CUDA context the copies land in.
 """
 import torch
@@ -53,22 +55,44 @@ class GLTexReader:
 
 
 class GLTexWriter:
-    """Registers a single-channel float32 (R32F) GL texture; copies a GPU (H, W)
-    float tensor straight into it — no host round-trip."""
-    def __init__(self, glo, w, h):
+    """Registers a float32 GL texture of `channels` channels (R32F or RGBA32F);
+    copies a GPU (H, W) or (H, W, channels) float tensor straight into it — no
+    host round-trip. Row 0 of the tensor is the texture's bottom row."""
+    def __init__(self, glo, w, h, channels=1):
         self.w, self.h = w, h
         self.res = _ck(cudart.cudaGraphicsGLRegisterImage(
             glo, GL_TEXTURE_2D,
             cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard))
-        self._row = w * 4   # float32
+        self._row = w * 4 * channels   # float32
 
-    def write(self, depth_hw):
-        d = depth_hw.contiguous()
+    def write(self, data):
+        d = data.contiguous()
         _ck(cudart.cudaGraphicsMapResources(1, self.res, 0))
         arr = _ck(cudart.cudaGraphicsSubResourceGetMappedArray(self.res, 0, 0))
         _ck(cudart.cudaMemcpy2DToArray(
             arr, 0, 0, d.data_ptr(), self._row, self._row, self.h,
             cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice))
+        _ck(cudart.cudaGraphicsUnmapResources(1, self.res, 0))
+
+    def close(self):
+        if self.res is not None:
+            cudart.cudaGraphicsUnregisterResource(self.res)
+            self.res = None
+
+
+class GLBufferWriter:
+    """Registers a GL buffer write-only; copies a GPU tensor's bytes into its
+    start, no host round-trip."""
+    def __init__(self, glo):
+        self.res = _ck(cudart.cudaGraphicsGLRegisterBuffer(
+            glo, cudart.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard))
+
+    def write(self, data):
+        d = data.contiguous()
+        _ck(cudart.cudaGraphicsMapResources(1, self.res, 0))
+        ptr, size = _ck(cudart.cudaGraphicsResourceGetMappedPointer(self.res))
+        _ck(cudart.cudaMemcpy(ptr, d.data_ptr(), min(size, d.numel() * d.element_size()),
+                              cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice))
         _ck(cudart.cudaGraphicsUnmapResources(1, self.res, 0))
 
     def close(self):

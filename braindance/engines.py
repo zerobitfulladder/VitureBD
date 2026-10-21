@@ -1,22 +1,27 @@
-"""build.py — turn a registered depth model into a runnable TensorRT engine.
+"""engines.py — turn the registered models into runnable TensorRT engines.
 
-Pipeline:  HuggingFace checkpoint --export--> ONNX --compile--> .engine (fp16)
+Pipeline:  checkpoint --export--> ONNX --compile--> .engine (fp16)
+
+Depth models come from HuggingFace. The stereo warp network (`mlbw`) and the
+inpainting network (`inpaint`) come from nunif's releases; mlbw gets one engine
+per weight level.
 
 Run once per machine. Engines are GPU- and TensorRT-version-specific, so they are
-NOT committed (gitignored); rebuild after changing GPU or the tensorrt package.
+NOT committed (gitignored, under models/); rebuild after changing GPU or the
+tensorrt package.
 
-  python models/build.py da2-small      # build one
-  python models/build.py --all          # build everything in the registry
-  python models/build.py da2-small --force   # re-export ONNX + rebuild engine
-
-Requires this dir's venv (torch + transformers + tensorrt). See requirements.txt.
+  uv run braindance-build-engine da2-small          # build one depth model
+  uv run braindance-build-engine mlbw               # build the stereo warp network
+  uv run braindance-build-engine inpaint            # build the inpainting network
+  uv run braindance-build-engine --all              # build everything
+  uv run braindance-build-engine da2-small --force  # re-export ONNX + rebuild engine
 """
 import argparse
 import os
 
 import torch
 
-import registry
+from . import registry
 
 
 def export_onnx(hf_id, path, h, w):
@@ -57,6 +62,10 @@ def build_engine(onnx_path, engine_path):
                 print("  ", parser.get_error(i))
             raise RuntimeError("ONNX parse failed for " + onnx_path)
     config = builder.create_builder_config()
+    # Level 5, the builder's most thorough kernel search (TensorRT's default is
+    # 3). On an RTX 3060 Laptop it made MLBW 16% faster and da2-small 4%, for
+    # builds of a minute (MLBW) to three (depth).
+    config.builder_optimization_level = 5
     print(f"[build] compiling engine -> {os.path.relpath(engine_path)} (~minutes)", flush=True)
     ser = builder.build_serialized_network(network, config)
     if ser is None:
@@ -80,17 +89,52 @@ def build(name, force=False):
         print(f"[build] engine already present {os.path.relpath(engine)} (use --force)", flush=True)
 
 
+def build_stereo(force=False):
+    from . import stereo
+    size = registry.STEREO["size"]
+    for lvl in registry.STEREO["weights"]:
+        onnx = registry.stereo_onnx_path(lvl, size)
+        engine = registry.stereo_engine_path(lvl, size)
+        if force or not os.path.exists(onnx):
+            stereo.export_onnx(lvl, size, onnx)
+        if force or not os.path.exists(engine):
+            build_engine(onnx, engine)
+        else:
+            print(f"[build] engine already present {os.path.relpath(engine)} (use --force)",
+                  flush=True)
+
+
+def build_inpaint(force=False):
+    from . import inpaint
+    size = registry.INPAINT["size"]
+    onnx = registry.inpaint_onnx_path(size)
+    engine = registry.inpaint_engine_path(size)
+    if force or not os.path.exists(onnx):
+        inpaint.export_onnx(size, onnx)
+    if force or not os.path.exists(engine):
+        build_engine(onnx, engine)
+    else:
+        print(f"[build] engine already present {os.path.relpath(engine)} (use --force)",
+              flush=True)
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("model", nargs="?", help="model name from the registry")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("model", nargs="?", help="a depth model from the registry, mlbw or inpaint")
     ap.add_argument("--all", action="store_true", help="build every registered model")
     ap.add_argument("--force", action="store_true", help="re-export ONNX and rebuild engine")
     a = ap.parse_args()
-    names = list(registry.MODELS) if a.all else [a.model]
+    names = list(registry.MODELS) + ["mlbw", "inpaint"] if a.all else [a.model]
     if not names or names == [None]:
-        ap.error("give a model name or --all. known: " + ", ".join(registry.MODELS))
+        ap.error("give a model name or --all. known: " + ", ".join(registry.MODELS) + ", mlbw, inpaint")
     for n in names:
-        build(n, force=a.force)
+        if n == "mlbw":
+            build_stereo(force=a.force)
+        elif n == "inpaint":
+            build_inpaint(force=a.force)
+        else:
+            build(n, force=a.force)
 
 
 if __name__ == "__main__":
