@@ -9,7 +9,12 @@ maps uv.y=1 -> screen top.
 """
 import numpy as np
 import moderngl
-from PIL import Image, ImageDraw, ImageFont
+
+from . import panel
+from .panel import Panel
+
+# how far the settings panel floats in front of the scene (NDC disparity)
+PANEL_DISP = 0.018
 
 # --- shaders ---------------------------------------------------------------
 
@@ -50,9 +55,9 @@ out vec4 f;
 void main() { f = texture(src, v_uv); }
 """
 
-# Per-eye present (mesh warp). disp=0 -> FLAT. The VS passes per-vertex depth to
-# a geometry shader that can TEAR the mesh (drop triangles spanning a big depth
-# jump) so foreground silhouettes pop crisply instead of ramping into the bg.
+# Per-eye present (mesh warp). disp=0 -> FLAT. Each vertex slides sideways by its
+# depth; z puts nearer vertices in front, so where the warp folds a near edge
+# over the background the near edge wins whatever order the rows are drawn in.
 WARP_VS = """
 #version 330
 in vec2 in_uv;
@@ -64,8 +69,8 @@ uniform float eye_sign;  // +1 / -1
 uniform float zoom;
 uniform vec2  pan;       // NDC
 uniform float climit;    // comfort clamp on |disparity| (NDC); <=0 = off
-out vec2 v_uv_g;
-out float v_depth_g;
+out vec2 v_uv;
+out float v_d;
 void main() {
     float d = texture(depth_tex, in_uv).r;
     vec2 p = in_uv * 2.0 - 1.0;          // uv.y=1 -> +1 (top)
@@ -74,151 +79,169 @@ void main() {
     float dval = disp * (d - 0.5);       // linear: zero-parallax at mid-depth
     if (climit > 0.0) dval = clamp(dval, -climit, climit);   // comfort clamp (3D pop only)
     p.x += eye_sign * (dval + vshift);   // + SCREEN DEPTH plane slide
-    gl_Position = vec4(p, 0.0, 1.0);
-    v_uv_g = in_uv;
-    v_depth_g = d;
+    gl_Position = vec4(p, 0.999 * (1.0 - 2.0 * clamp(d, 0.0, 1.0)), 1.0);
+    v_uv = in_uv;
+    v_d = d;
 }
 """
-# Drop a triangle whose vertices straddle a depth discontinuity larger than
-# `tear` (in normalized depth). tear huge (1e9) => never tears (continuous warp).
-WARP_GS = """
-#version 330
-layout(triangles) in;
-layout(triangle_strip, max_vertices = 3) out;
-in vec2 v_uv_g[];
-in float v_depth_g[];
-uniform float tear;      // spread above which a triangle is a depth cliff
-uniform int   fill;      // 0 = tear pass (drop cliffs); 1 = background-stretch fill
-out vec2 v_uv;
-out float v_d;
-void main() {
-    float a = v_depth_g[0], b = v_depth_g[1], c = v_depth_g[2];
-    float spread = max(max(abs(a - b), abs(b - c)), abs(a - c));
-    bool cliff = spread > tear;
-    if (cliff && fill == 0) return;      // tear pass: tear the cliff triangle away
-    // background-stretch fill: paint a cliff triangle with its FARTHEST (background)
-    // vertex's color, so the disocclusion gap reads as stretched background instead
-    // of a foreground->background ramp. (larger depth = nearer, so background = min.)
-    vec2 bg_uv = v_uv_g[0]; float bgd = a;
-    if (b < bgd) { bgd = b; bg_uv = v_uv_g[1]; }
-    if (c < bgd) { bgd = c; bg_uv = v_uv_g[2]; }
-    for (int i = 0; i < 3; i++) {
-        gl_Position = gl_in[i].gl_Position;
-        v_uv = (cliff && fill == 1) ? bg_uv : v_uv_g[i];
-        v_d  = v_depth_g[i];
-        EmitVertex();
-    }
-    EndPrimitive();
-}
-"""
+# Besides the color, the mesh writes how stretched each pixel is: where depth
+# rises steeply in the direction this eye shifts near things, the triangles
+# there are drawn many times wider than they are in the desktop. Across a depth
+# edge that stretch is the background the near object uncovered, painted with
+# the edge's own colours (the streaks). EDGE_FILL_FS replaces it.
 WARP_FS = """
 #version 330
 in vec2 v_uv;
 in float v_d;
 uniform sampler2D color_tex;
+uniform sampler2D depth_tex;
 uniform float show_depth;     // 1 -> draw the depth map (grayscale) instead of color
-out vec4 f;
+uniform float disp;           // as in WARP_VS
+uniform float eye_sign;
+uniform float zoom;
+uniform float climit;
+uniform float dtexel;         // 1 / depth width
+uniform float src_px;         // target px per uv (eye width x zoom)
+layout(location = 0) out vec4 f;
+layout(location = 1) out vec4 m;  // stretch, 1 if the background lies left, unwarped x (px)
+float shift(float d) {
+    float s = disp * (d - 0.5);
+    return climit > 0.0 ? clamp(s, -climit, climit) : s;
+}
 void main() {
     f = (show_depth > 0.5) ? vec4(vec3(v_d), 1.0) : texture(color_tex, v_uv);
+    float dl = texture(depth_tex, v_uv - vec2(dtexel, 0.0)).r;
+    float dr = texture(depth_tex, v_uv + vec2(dtexel, 0.0)).r;
+    float stretch = 1.0 + eye_sign * (shift(dr) - shift(dl)) / (4.0 * zoom * dtexel);
+    m = vec4(stretch, dl < dr ? 1.0 : 0.0, v_uv.x * src_px, 1.0);
 }
 """
 
-# Same warp WITHOUT the geometry shader, for the no-tear path (the common case).
-# The GS is only needed for tearing and is the dominant present cost at high grid;
-# with tear off it's a pure passthrough. Derived from WARP_VS so the displacement
-# math stays single-sourced — only the outputs are renamed to feed WARP_FS directly
-# (v_uv/v_d) instead of the GS-bound *_g names.
-WARP_VS_NOGS = (WARP_VS
-                .replace("out vec2 v_uv_g;", "out vec2 v_uv;")
-                .replace("out float v_depth_g;", "out float v_d;")
-                .replace("v_uv_g = in_uv;", "v_uv = in_uv;")
-                .replace("v_depth_g = d;", "v_d = d;"))
-
-HUD_VS = """
-#version 330
-in vec2 in_pos;
-in vec2 in_uv;
-out vec2 v_uv;
-void main() { gl_Position = vec4(in_pos, 0.0, 1.0); v_uv = in_uv; }
-"""
-HUD_FS = """
+# Disocclusion fill. Along a row, a run of stretched pixels is either a steep
+# surface (drawn wider in this eye, as it should be) or a depth edge, where the
+# run is wider than the desktop pixels it shows by the background the near
+# object uncovered. A run that uncovers `cliff_px` or more is an edge: it gets
+# the background beside it mirrored in, and so do `halo` px of that background,
+# which carry the near object's blurred rim (left behind at background depth,
+# it would outline the fill). The fill blends into the near object over
+# `feather` px. Output: rgb = fill colour, a = its weight (0 = keep the mesh).
+EDGE_FILL_FS = """
 #version 330
 in vec2 v_uv;
-uniform sampler2D hud_tex;
+uniform sampler2D msk;        // WARP_FS's stretch map
+uniform sampler2D col;        // WARP_FS's color
+uniform vec2 texel;
+uniform float cliff_px;
+uniform float feather;
+uniform int halo;
 out vec4 f;
-void main() { f = texture(hud_tex, v_uv); }
-"""
-
-# Settings OSD panel: a textured quad floated in front via a per-eye x offset.
-PANEL_VS = """
-#version 330
-in vec2 in_pos;
-in vec2 in_uv;
-uniform vec2 off;      // per-eye NDC offset (disparity)
-out vec2 v_uv;
-void main() { gl_Position = vec4(in_pos + off, 0.0, 1.0); v_uv = in_uv; }
-"""
-
-# Animated OSD: samples the cached panel bitmap with cyberpunk effects — chromatic
-# aberration (subtle, amplified during a glitch burst), occasional horizontal-slice
-# glitch + noise flash, a breathing magenta edge-glow, and a noise "materialize"
-# dissolve on open (`appear` 0->1). No scanlines, no flicker. `time` = small seconds.
-PANEL_FS = """
-#version 330
-in vec2 v_uv;
-uniform sampler2D hud_tex;
-uniform float time;
-uniform float appear;     // 0..1 open materialize
-out vec4 f;
-float h1(float x){ return fract(sin(x * 12.9898) * 43758.5453123); }
-float h2(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453123); }
+const float RUN = 1.5;        // stretch from which a pixel belongs to a run
+const int MAXW = 400;         // the widest run looked at (px)
+vec4 at(int i, float dir) { return texture(msk, v_uv + vec2(dir * float(i) * texel.x, 0.0)); }
+// The run through pixel `start` (in steps of dir): kb, the first pixel past it
+// toward the background; ko, toward the near object. Returns how much of a
+// cliff it is (0..1) from the px it uncovers.
+float cliff(int start, float dir, out int kb, out int ko) {
+    kb = 0; ko = 0;
+    for (int i = start; i <= start + MAXW; i++) if (at(i, dir).r <= RUN) { kb = i; break; }
+    for (int i = start; i >= start - MAXW; i--) if (at(i, dir).r <= RUN) { ko = i; break; }
+    if (kb == 0 || ko == 0) return 0.0;
+    float uncovered = float(kb - ko) - abs(at(kb, dir).b - at(ko, dir).b);
+    return smoothstep(0.5 * cliff_px, 1.5 * cliff_px, uncovered);
+}
 void main() {
-    vec2 uv = v_uv;
-    // occasional brief glitch burst
-    float win = floor(time * 3.0);
-    float burst = step(0.90, h1(win)) * (0.4 + 0.6 * h1(win + 7.0));
-    float slice = floor(uv.y * 26.0);
-    float jit = step(0.55, h1(slice * 1.7 + floor(time * 22.0)));
-    uv.x += burst * (h1(slice + floor(time * 22.0)) - 0.5) * 0.08 * jit;
-    // chromatic aberration (subtle base + burst)
-    float ca = 0.0016 + burst * 0.006;
-    float r = texture(hud_tex, clamp(uv + vec2(ca, 0.0), 0.0, 1.0)).r;
-    vec4  m = texture(hud_tex, clamp(uv, 0.0, 1.0));
-    float b = texture(hud_tex, clamp(uv - vec2(ca, 0.0), 0.0, 1.0)).b;
-    vec4 col = vec4(r, m.g, b, m.a);
-    // noise flash during a burst
-    col.rgb += burst * (h2(uv * vec2(800.0, 460.0) + time) - 0.5) * 0.18 * col.a;
-    // breathing magenta edge-glow on the panel border
-    vec2 dd = min(v_uv, 1.0 - v_uv);
-    float edge = 1.0 - smoothstep(0.0, 0.05, min(dd.x, dd.y));
-    float pulse = 0.55 + 0.45 * sin(time * 3.0);
-    col.rgb += edge * pulse * vec3(1.0, 0.16, 0.43) * 0.6 * col.a;
-    // open: glitchy scan-lock reveal. Horizontal bands snap in OUT OF ORDER with a
-    // sideways tear + RGB split + static, each resolving into the clean panel — reads
-    // as a signal locking in line by line, not a blocky square slide.
-    if (appear < 0.999) {
-        float row  = floor(v_uv.y * 30.0);
-        float thr  = h1(row * 1.93 + 0.5);                  // per-row reveal threshold
-        float lock = smoothstep(thr, thr + 0.18, appear);   // 0 scrambled .. 1 locked
-        float unl  = 1.0 - lock;
-        float j    = (h1(row + floor(time * 28.0)) - 0.5) * unl;       // sideways tear
-        vec2  tuv  = clamp(v_uv + vec2(j * 0.6, 0.0), 0.0, 1.0);
-        float sp   = 0.03 * unl;                                       // RGB split width
-        vec4  ts   = texture(hud_tex, tuv);
-        vec3  tc   = vec3(texture(hud_tex, clamp(tuv + vec2(sp, 0.0), 0.0, 1.0)).r,
-                          ts.g,
-                          texture(hud_tex, clamp(tuv - vec2(sp, 0.0), 0.0, 1.0)).b);
-        tc += (h2(v_uv * vec2(700.0, 40.0) + time) - 0.5) * 0.6 * unl;  // static hash
-        col.rgb = mix(tc, col.rgb, lock);
-        col.a   = mix(ts.a, col.a, lock);
-        float front = smoothstep(0.05, 0.0, abs(appear - thr)) * unl;   // tracking spark
-        col.rgb += front * vec3(0.1, 0.95, 1.0) * 0.8;
-        col.a *= smoothstep(0.0, 0.12, appear);             // global fade floor
+    vec4 mk = texture(msk, v_uv);
+    float dir = 0.0, w = 0.0;
+    int c0 = 0, kb, ko;                   // c0: px to the clean background, along dir
+    if (mk.r > RUN) {
+        dir = mk.g > 0.5 ? -1.0 : 1.0;
+        float wc = cliff(0, dir, kb, ko);
+        if (wc > 0.0) { c0 = kb + halo; w = wc * smoothstep(0.0, feather, float(-ko)); }
+    } else {
+        // in the halo: the nearest run within `halo` px on either side, if its
+        // background lies on our side
+        for (int side = -1; side <= 1 && c0 == 0; side += 2) {
+            for (int j = 1; j <= halo; j++) {
+                vec4 a = at(j, float(side));
+                if (a.r <= RUN) continue;
+                if ((side < 0) == (a.g < 0.5)) {
+                    float wc = cliff(-j, -float(side), kb, ko);
+                    if (wc > 0.0) { dir = -float(side); c0 = halo - j + 1; w = wc; }
+                }
+                break;
+            }
+        }
     }
-    f = col;
+    if (c0 == 0) { f = vec4(0.0); return; }
+    vec2 stp = vec2(dir * texel.x, 0.0);
+    vec2 s = v_uv + float(2 * c0) * stp;  // mirror about the clean edge
+    if (texture(msk, s).r > RUN) s = v_uv + float(c0) * stp;
+    f = vec4(texture(col, s).rgb, w);
 }
 """
 
+# Packs one eye, shrunk to the inpainting network's size (inpaint.py), into its
+# half of the network's input: RGB, and as alpha the mask of what to paint, the
+# filled pixels grown over the same 13 x 3 window EDGE_MIX_FS blends over. Rows
+# go top first (CUDA reads row 0 first), and the left eye is mirrored: the
+# network expects the holes on the right of near things, as the right eye has.
+EDGE_PACK_FS = """
+#version 330
+in vec2 v_uv;
+uniform sampler2D col;        // the eye's mesh colour
+uniform sampler2D fil;        // its EDGE_FILL_FS output
+uniform float mirror;         // 1 for the left eye
+uniform vec2 texel;           // one eye-target px, in uv
+uniform vec2 step;            // one packed px, in uv
+out vec4 f;
+void main() {
+    vec2 uv = vec2(mirror > 0.5 ? 1.0 - v_uv.x : v_uv.x, 1.0 - v_uv.y);
+    vec3 c = vec3(0.0);
+    for (int i = 0; i < 4; i++)
+        c += texture(col, uv + (vec2(float(i & 1), float(i >> 1)) - 0.5) * 0.5 * step).rgb;
+    float m = 0.0;
+    for (int dy = -6; dy <= 6; dy += 2)
+        for (int dx = -1; dx <= 1; dx++)
+            m = max(m, texture(fil, uv + vec2(float(dx), float(dy)) * texel).a);
+    f = vec4(0.25 * c, m > 0.0 ? 1.0 : 0.0);
+}
+"""
+
+# Blends the fill into the mesh. The fill is decided row by row, so its weight
+# is averaged over a tall window (13 x 3) of the filled pixels, and so is the
+# mirror fill's colour: rows that disagree fade into each other instead of
+# stepping. The network's picture comes in whole, upsampled.
+EDGE_MIX_FS = """
+#version 330
+in vec2 v_uv;
+uniform sampler2D col;
+uniform sampler2D fil;        // EDGE_FILL_FS's output
+uniform sampler2D net;        // the network's picture of both eyes, packed as EDGE_PACK_FS
+uniform vec2 texel;
+uniform float source;         // 0 the mirror fill, 1 the network's, 2 magenta (FILL DEBUG)
+uniform vec2 net_x;           // this eye's u in `net`: net_x.x + net_x.y * u
+out vec4 f;
+void main() {
+    vec3 c = texture(col, v_uv).rgb;
+    vec3 s = vec3(0.0);
+    float n = 0.0, wsum = 0.0;
+    for (int dy = -6; dy <= 6; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            vec4 q = texture(fil, v_uv + vec2(float(dx), float(dy)) * texel);
+            if (q.a > 0.0) { s += q.rgb; n += 1.0; wsum += q.a; }
+        }
+    if (n == 0.0) { f = vec4(c, 1.0); return; }
+    float w = max(texture(fil, v_uv).a, wsum / 39.0);
+    vec3 fc = source > 1.5 ? vec3(1.0, 0.0, 0.6)
+            : source > 0.5 ? texture(net, vec2(net_x.x + net_x.y * v_uv.x, 1.0 - v_uv.y)).rgb
+            : s / n;
+    f = vec4(mix(c, fc, w), 1.0);
+}
+"""
+
+# The cursor: a small classic arrow pointing up-left, its tip (the hotspot) at
+# the local origin, the left edge straight down, the diagonal back up-right.
+CURSOR_TRI = np.array([0.0, 0.0,  0.0, -1.4,  0.95, -0.95], dtype="f4")
 CURSOR_VS = """
 #version 330
 in vec2 in_p;          // unit quad [-1,1]
@@ -252,67 +275,12 @@ void main() {
 }
 """
 
-# Disocclusion inpaint (texture-continuation). The per-eye warp leaves torn gaps as
-# holes (alpha 0). Stereo disparity is horizontal, so a gap is a 1-D strip with
-# BACKGROUND on a known side (left eye pulls left, right eye pulls right => `dir`).
-# For each hole pixel we walk `dir` to the background edge, then CONTINUE the
-# background by reflecting it across the edge into the gap (edge maps to itself =>
-# seamless, and the bg texture/gradient carries on instead of a flat smear).
-INPAINT_FS = """
-#version 330
-in vec2 v_uv;
-uniform sampler2D src;     // per-eye warped color; alpha 0 = disocclusion hole
-uniform vec2 texel;        // 1 / (eye_w, eye_h) at present res
-uniform float dir;         // background march direction in x: -1 (left eye) / +1
-out vec4 f;
-const int MAXW = 256;      // widest hole we attempt to fill (texels)
-void main() {
-    vec4 c = texture(src, v_uv);
-    if (c.a > 0.5) { f = vec4(c.rgb, 1.0); return; }     // not a hole -> passthrough
-    vec2 stp = vec2(dir * texel.x, 0.0);
-    int k = 0;                                           // steps to background edge
-    for (int i = 1; i <= MAXW; i++) {
-        if (texture(src, v_uv + float(i) * stp).a > 0.5) { k = i; break; }
-    }
-    if (k == 0) { f = vec4(c.rgb, 0.0); return; }         // unfilled hole -> a=0
-    // reflect across the edge: hole pixel k texels inside <- bg pixel k texels past
-    vec4 b = texture(src, v_uv + float(2 * k) * stp);
-    if (b.a <= 0.5) b = texture(src, v_uv + float(k) * stp);   // thin bg -> edge px
-    f = vec4(b.rgb, 0.0);                                 // filled -> mark a=0
-}
-"""
-
-# Smooth the inpainted region to break up the horizontal streaks that 1-D
-# continuation leaves. Vertical-biased box over ONLY the filled pixels (alpha 0),
-# so the high vertical-frequency stripes average out while foreground and crisp
-# background edges (alpha 1) are never pulled in.
-INPAINT_SMOOTH_FS = """
-#version 330
-in vec2 v_uv;
-uniform sampler2D src;     // fill RT: rgb=color, a=1 original / a=0 inpainted
-uniform vec2 texel;
-out vec4 f;
-const int RY = 6;          // vertical radius (kills horizontal streaks)
-const int RX = 1;          // small horizontal radius (keep bg continuation)
-void main() {
-    vec4 c = texture(src, v_uv);
-    if (c.a > 0.5) { f = vec4(c.rgb, 1.0); return; }     // original -> passthrough
-    vec3 sum = vec3(0.0); float w = 0.0;
-    for (int dy = -RY; dy <= RY; dy++)
-        for (int dx = -RX; dx <= RX; dx++) {
-            vec4 s = texture(src, v_uv + vec2(float(dx), float(dy)) * texel);
-            if (s.a < 0.5) { sum += s.rgb; w += 1.0; }   // blend filled pixels only
-        }
-    f = vec4(w > 0.0 ? sum / w : c.rgb, 1.0);
-}
-"""
-
 # Edge-aware depth UPSAMPLE: a COLOR-guided joint-bilateral filter run at HIGH
 # output resolution. For each output texel, average low-res depth samples weighted
 # by spatial distance AND color similarity to the center (full-res color guide) —
 # so the soft, low-res DA2 edge snaps onto the real silhouette at high res (kills
-# the laddery edges, and gives the mesh a real cliff to tear). dtexel = OUTPUT
-# texel (offsets walk the full-res guide); sigma_c small = tighter edge-snapping.
+# the laddery edges). dtexel = OUTPUT texel (offsets walk the full-res guide);
+# sigma_c small = tighter edge-snapping.
 SHARP_FS = """
 #version 330
 in vec2 v_uv;
@@ -434,6 +402,39 @@ out vec4 f;
 void main() { float d = texture(depth_tex, v_uv).r; f = vec4(vec3(d), 1.0); }
 """
 
+# Per-eye present, learned backward warp (stereo.py): each pixel of an eye is the
+# weighted blend of the desktop sampled at two horizontal offsets the network
+# predicted for it. Zoom, pan and SCREEN DEPTH map the eye's pixel back to the
+# scene first, as the mesh warp maps the scene forward.
+MLBW_FS = """
+#version 330
+in vec2 v_uv;                 // 0..1 over this eye's viewport, v=1 = top
+uniform sampler2D color_tex;  // the desktop, v=1 = top
+uniform sampler2D depth_tex;
+uniform sampler2D flow_tex;   // this eye's (d0, d1, w0, w1); offsets in network px
+uniform float eye_sign;       // +1 left eye: sample at x + d; -1 right eye: x - d
+uniform float uv_scale;       // network px -> uv
+uniform float zoom;
+uniform vec2  pan;            // NDC
+uniform float vshift;         // SCREEN DEPTH: constant per-eye plane slide (NDC)
+uniform float climit;         // comfort clamp on |offset| (uv); <= 0 = off
+uniform float show_depth;     // 1 -> warp the depth map (grayscale) instead of color
+out vec4 f;
+vec3 src(vec2 uv) {
+    return show_depth > 0.5 ? vec3(texture(depth_tex, uv).r) : texture(color_tex, uv).rgb;
+}
+void main() {
+    vec2 p = v_uv * 2.0 - 1.0;
+    p.x -= eye_sign * vshift;
+    vec2 s = (p - pan) / zoom * 0.5 + 0.5;
+    if (s.x < 0.0 || s.y < 0.0 || s.x > 1.0 || s.y > 1.0) { f = vec4(0.0, 0.0, 0.0, 1.0); return; }
+    vec4 fl = texture(flow_tex, s);
+    vec2 d = fl.xy * (uv_scale * eye_sign);
+    if (climit > 0.0) d = clamp(d, -climit, climit);
+    f = vec4(fl.z * src(vec2(s.x + d.x, s.y)) + fl.w * src(vec2(s.x + d.y, s.y)), 1.0);
+}
+"""
+
 
 def _grid(gx, gy):
     xs = np.linspace(0, 1, gx + 1, dtype="f4")
@@ -450,6 +451,7 @@ def _grid(gx, gy):
 class Renderer:
     def __init__(self, ctx, pw, ph, eye_w, region, grid=256, depth_h=392, ss=1.0):
         self.ctx = ctx
+        self.screen = ctx.screen        # where draw() presents; a framebuffer offscreen
         self.pw, self.ph, self.eye_w = pw, ph, eye_w
         self.rw, self.rh = region
         self.eye_h = ph
@@ -458,6 +460,9 @@ class Renderer:
         # work-area RT (composited desktop), v=1 = top
         self.work = ctx.framebuffer(color_attachments=[ctx.texture((self.rw, self.rh), 3)])
         self.work.color_attachments[0].filter = (moderngl.LINEAR, moderngl.LINEAR)
+        # clamp to edge: the mlbw warp samples past the borders (grid_sample "border")
+        self.work.color_attachments[0].repeat_x = False
+        self.work.color_attachments[0].repeat_y = False
 
         # downscaled RT for depth-model readback
         dw = max(14, int(round(depth_h * self.rw / self.rh / 14)) * 14)
@@ -469,14 +474,17 @@ class Renderer:
         self._pbo_i = 0
         self._pbo_primed = False
 
-        # depth texture (uploaded each time a new map arrives)
-        self.depth_tex = ctx.texture((dw, depth_h), 1, dtype="f4")
-        self.depth_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        # depth and per-eye stereo offsets, at the depth pipeline's size (attach_depth)
+        self.depth_tex = self._float_tex((dw, depth_h), 1)
         self.depth_tex.write(np.full((depth_h, dw), 0.5, dtype="f4").tobytes())
+        self.flow_tex = [None, None]
+        self.has_flow = False         # the flow textures hold offsets for the current depth
+        self.flow_uv = 0.0            # network px -> uv for those offsets
 
-        # GL<->CUDA interop (lazy; the sync depth path enables it). None when off.
+        # GL<->CUDA interop for the depth pipeline (attach_depth). None when off.
         self.idsrc = None
         self._ireader = self._iwriter = None
+        self._fwriters = [None, None]
 
         # edge-aware depth UPSAMPLE: color-guided joint-bilateral into dref_tex at
         # HIGH resolution (not the model's low res), so the warp samples crisp,
@@ -523,85 +531,50 @@ class Renderer:
         self.depthview["depth_tex"] = 0
         self.depthview_vao = ctx.vertex_array(
             self.depthview, [(ctx.buffer(unit.tobytes()), "2f", "in_uv")])
+        self.mlbw = ctx.program(vertex_shader=BLIT_VS, fragment_shader=MLBW_FS)
+        self.mlbw["color_tex"] = 0
+        self.mlbw["depth_tex"] = 1
+        self.mlbw["flow_tex"] = 2
+        self.mlbw_vao = ctx.vertex_array(self.mlbw, [(ctx.buffer(unit.tobytes()), "2f", "in_uv")])
 
         gy = max(1, grid * self.rh // self.rw)
         uv, idx = _grid(grid, gy)
         uvbuf, idxbuf = ctx.buffer(uv.tobytes()), ctx.buffer(idx.tobytes())
-        self.warp = ctx.program(vertex_shader=WARP_VS, geometry_shader=WARP_GS,
-                                fragment_shader=WARP_FS)
+        self.warp = ctx.program(vertex_shader=WARP_VS, fragment_shader=WARP_FS)
         self.warp["color_tex"] = 0
         self.warp["depth_tex"] = 1
-        self.warp["tear"] = 1e9          # default: no tearing (continuous)
-        self.warp["fill"] = 0            # 1 -> background-stretch fill (tear pass 1)
-        self.warp["show_depth"] = 0.0    # 1 -> render depth map as grayscale (3D view)
-        self.warp["climit"] = 0.0        # comfort disparity clamp (NDC); 0 = off
-        self.warp["vshift"] = 0.0        # SCREEN DEPTH: constant per-eye plane slide (NDC)
-        self.warp_vao = ctx.vertex_array(
-            self.warp, [(uvbuf, "2f", "in_uv")], idxbuf)
-        # GS-free twin for the no-tear path (the common case): the geometry shader is
-        # only needed for tearing and is the dominant present cost at high grid.
-        # Shares the mesh buffers; pixel-identical to the GS warp when tear is off.
-        self.warp_nogs = ctx.program(vertex_shader=WARP_VS_NOGS, fragment_shader=WARP_FS)
-        self.warp_nogs["color_tex"] = 0
-        self.warp_nogs["depth_tex"] = 1
-        self.warp_nogs["show_depth"] = 0.0
-        self.warp_nogs["climit"] = 0.0
-        self.warp_nogs["vshift"] = 0.0
-        self.warp_nogs_vao = ctx.vertex_array(
-            self.warp_nogs, [(uvbuf, "2f", "in_uv")], idxbuf)
+        self.warp_vao = ctx.vertex_array(self.warp, [(uvbuf, "2f", "in_uv")], idxbuf)
+        # disocclusion fill: each eye's mesh goes to its own targets (eye_fbo), and
+        # the fill and the blend bring it to the screen
+        self.edge_fill = ctx.program(vertex_shader=BLIT_VS, fragment_shader=EDGE_FILL_FS)
+        self.edge_fill["msk"] = 0
+        self.edge_fill["col"] = 1
+        self.edge_fill_vao = ctx.vertex_array(
+            self.edge_fill, [(ctx.buffer(unit.tobytes()), "2f", "in_uv")])
+        self.edge_mix = ctx.program(vertex_shader=BLIT_VS, fragment_shader=EDGE_MIX_FS)
+        self.edge_mix["col"] = 0
+        self.edge_mix["fil"] = 1
+        self.edge_mix["net"] = 2
+        self.edge_mix_vao = ctx.vertex_array(
+            self.edge_mix, [(ctx.buffer(unit.tobytes()), "2f", "in_uv")])
+        self.eye_fbo = self.fill_fbo = None     # [left, right]
+        # the network fill: both eyes packed for it, and its picture (_ensure_net)
+        self.edge_pack = ctx.program(vertex_shader=BLIT_VS, fragment_shader=EDGE_PACK_FS)
+        self.edge_pack["col"] = 0
+        self.edge_pack["fil"] = 1
+        self.edge_pack_vao = ctx.vertex_array(
+            self.edge_pack, [(ctx.buffer(unit.tobytes()), "2f", "in_uv")])
+        self.pack_fbo = self.net_tex = None
+        self._preader = self._nwriter = None
 
-        # HUD
-        self.HUD_W, self.HUD_H = 680, 40
-        try:
-            self.font = ImageFont.truetype("DejaVuSans.ttf", 22)
-        except Exception:
-            self.font = ImageFont.load_default()
-        self.hud = ctx.program(vertex_shader=HUD_VS, fragment_shader=HUD_FS)
-        self.hud["hud_tex"] = 0
-        hwn, hhn = (self.HUD_W / eye_w) * 2.0, (self.HUD_H / ph) * 2.0
-        x0, y1 = -0.97, 0.97; x1, y0 = x0 + hwn, y1 - hhn
-        quad = np.array([x0, y1, 0, 0, x1, y1, 1, 0, x0, y0, 0, 1,
-                         x1, y1, 1, 0, x1, y0, 1, 1, x0, y0, 0, 1], dtype="f4")
-        self.hud_vao = ctx.vertex_array(self.hud, [(ctx.buffer(quad.tobytes()), "2f 2f", "in_pos", "in_uv")])
-        self.hud_tex = ctx.texture((self.HUD_W, self.HUD_H), 4)
-        self.hud_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
-        self.set_hud("starting...")
-
-        # custom cursor: a small classic arrow pointing up-left (tip = hotspot at
-        # local origin; left edge straight down, diagonal back up-right), constant
-        # on-screen size, with its own disparity to float above.
-        ctri = np.array([0.0, 0.0,  0.0, -1.4,  0.95, -0.95], dtype="f4")
+        # the cursor (CURSOR_TRI), at a constant on-screen size, with its own
+        # disparity to float above
         self.cursor = ctx.program(vertex_shader=CURSOR_VS, fragment_shader=CURSOR_FS)
-        self.cursor_vao = ctx.vertex_array(self.cursor, [(ctx.buffer(ctri.tobytes()), "2f", "in_p")])
+        self.cursor_vao = ctx.vertex_array(self.cursor, [(ctx.buffer(CURSOR_TRI.tobytes()), "2f", "in_p")])
         self.aspect = eye_w / ph
 
-        # --- settings OSD panel (toggled by Super+Alt+S) ---------------------
-        # compact, anchored BOTTOM-RIGHT so the scene centre stays visible while
-        # the panel is open (test 3D live); tabbed single column (see set_panel).
-        self.PANEL_W, self.PANEL_H = 640, 436
-        self.panel_disp = 0.018            # floats in front of the scene
-        try:
-            self.pfont = ImageFont.truetype("DejaVuSansMono.ttf", 21)
-            self.pfont_b = ImageFont.truetype("DejaVuSansMono-Bold.ttf", 26)
-            self.pfont_s = ImageFont.truetype("DejaVuSansMono.ttf", 16)
-        except Exception:
-            self.pfont = self.pfont_b = self.pfont_s = ImageFont.load_default()
-        self.panel = ctx.program(vertex_shader=PANEL_VS, fragment_shader=PANEL_FS)
-        self.panel["hud_tex"] = 0
-        pwn, phn = (self.PANEL_W / eye_w), (self.PANEL_H / ph)   # half-extents in NDC
-        mx, my = 0.04, 0.05                # right / bottom margins (NDC)
-        cx, cy = 1.0 - mx - pwn, -1.0 + my + phn
-        x0, x1, y0, y1 = cx - pwn, cx + pwn, cy - phn, cy + phn
-        pquad = np.array([x0, y1, 0, 0, x1, y1, 1, 0, x0, y0, 0, 1,
-                          x1, y1, 1, 0, x1, y0, 1, 1, x0, y0, 0, 1], dtype="f4")
-        self.panel_vao = ctx.vertex_array(
-            self.panel, [(ctx.buffer(pquad.tobytes()), "2f 2f", "in_pos", "in_uv")])
-        self.panel_tex = ctx.texture((self.PANEL_W, self.PANEL_H), 4)
-        self.panel_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.panel_tex.repeat_x = False     # clamp: CA/glitch sample past the edge
-        self.panel_tex.repeat_y = False
-        self._panel_sig = None
+        # settings panel (opened with the mouse's side button), drawn per eye by draw_panel
+        self.panel = Panel(ctx)
 
         # SSAA present buffer: render the warp + cursor at ss x panel res into an
         # offscreen RT, then box-downsample to the screen (see RESOLVE_FS). The
@@ -613,20 +586,6 @@ class Renderer:
         self.ss_tex = None
         self.ss_fbo = None
         self._alloc_ss()
-
-        # disocclusion inpaint: per-eye warp RT (color+hole mask) + fill pass
-        self.inpaint = ctx.program(vertex_shader=BLIT_VS, fragment_shader=INPAINT_FS)
-        self.inpaint["src"] = 0
-        self.inpaint_vao = ctx.vertex_array(
-            self.inpaint, [(ctx.buffer(unit.tobytes()), "2f", "in_uv")])
-        self.smooth = ctx.program(vertex_shader=BLIT_VS, fragment_shader=INPAINT_SMOOTH_FS)
-        self.smooth["src"] = 0
-        self.smooth_vao = ctx.vertex_array(
-            self.smooth, [(ctx.buffer(unit.tobytes()), "2f", "in_uv")])
-        self.warp_tex = None
-        self.warp_fbo = None
-        self.fill_tex = None
-        self.fill_fbo = None
 
     def _alloc_ss(self):
         """(Re)allocate the supersample RT for the current self.ss (None if off)."""
@@ -649,25 +608,75 @@ class Renderer:
         self.ss = factor
         self._alloc_ss()
 
-    def _ensure_warp_rt(self, ew, eh):
-        """Per-eye RGBA RT the warp renders into for inpaint mode: RGB = warped
-        color, A = coverage (0 at torn disocclusion holes). NEAREST + clamp so the
-        hole mask stays binary and the horizontal march can't wrap across eyes."""
-        if self.warp_tex is not None and self.warp_tex.size == (ew, eh):
+    def _ensure_eye_rt(self, ew, eh):
+        """Each eye's mesh targets (color, stretch map, depth buffer) and fill
+        target, at the present size. Clamped, so the fill's row walks stop at
+        the eye's edge; the fill's taps land on pixel centres, so the color's
+        LINEAR (for EDGE_PACK_FS) reads the same whole pixels there."""
+        if self.eye_fbo is not None and self.eye_fbo[0].size == (ew, eh):
             return
-        if self.warp_fbo is not None:
-            self.warp_fbo.release()
-            self.warp_tex.release()
-            self.fill_fbo.release()
-            self.fill_tex.release()
-        self.warp_tex = self.ctx.texture((ew, eh), 4)
-        self.fill_tex = self.ctx.texture((ew, eh), 4)   # inpaint output (a=0 = filled)
-        for t in (self.warp_tex, self.fill_tex):
-            t.filter = (moderngl.NEAREST, moderngl.NEAREST)
-            t.repeat_x = False
-            t.repeat_y = False
-        self.warp_fbo = self.ctx.framebuffer(color_attachments=[self.warp_tex])
-        self.fill_fbo = self.ctx.framebuffer(color_attachments=[self.fill_tex])
+        for fbo in (*(self.eye_fbo or ()), *(self.fill_fbo or ())):
+            for t in (*fbo.color_attachments, fbo.depth_attachment):
+                if t is not None:
+                    t.release()
+            fbo.release()
+        self.eye_fbo, self.fill_fbo = [], []
+        for _ in range(2):
+            col = self.ctx.texture((ew, eh), 4)
+            msk = self.ctx.texture((ew, eh), 4, dtype="f4")
+            fil = self.ctx.texture((ew, eh), 4)
+            for t in (msk, fil):
+                t.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            for t in (col, msk, fil):
+                t.repeat_x = t.repeat_y = False
+            self.eye_fbo.append(self.ctx.framebuffer(
+                color_attachments=[col, msk], depth_attachment=self.ctx.depth_renderbuffer((ew, eh))))
+            self.fill_fbo.append(self.ctx.framebuffer(color_attachments=[fil]))
+
+    def _ensure_net(self, size):
+        """The network fill's packed input (RGBA8, read by CUDA) and its picture
+        (RGBA32F, written by CUDA), both eyes side by side at the network's
+        per-eye `size` (h, w)."""
+        h, w = size
+        if self.pack_fbo is not None and self.pack_fbo.size == (2 * w, h):
+            return
+        self._release_net()
+        from .glcuda import GLTexReader, GLTexWriter
+        self.pack_fbo = self.ctx.framebuffer(color_attachments=[self.ctx.texture((2 * w, h), 4)])
+        self.net_tex = self._float_tex((2 * w, h), 4)
+        self._preader = GLTexReader(self.pack_fbo.color_attachments[0].glo, 2 * w, h)
+        self._nwriter = GLTexWriter(self.net_tex.glo, 2 * w, h, channels=4)
+
+    def _release_net(self):
+        for o in (self._preader, self._nwriter):
+            if o is not None:
+                o.close()
+        self._preader = self._nwriter = None
+        if self.pack_fbo is not None:
+            self.pack_fbo.color_attachments[0].release()
+            self.pack_fbo.release()
+            self.net_tex.release()
+            self.pack_fbo = self.net_tex = None
+
+    def _paint(self, inpaint, ew, eh):
+        """Run the network fill on both eyes' fills: pack them, paint, and put
+        its picture in net_tex. False when nothing needs painting."""
+        self._ensure_net(inpaint.size)
+        h, w = inpaint.size
+        self.edge_pack["texel"].value = (1.0 / ew, 1.0 / eh)
+        self.edge_pack["step"].value = (1.0 / w, 1.0 / h)
+        self.pack_fbo.use()
+        for half in range(2):
+            self.ctx.viewport = (half * w, 0, w, h)
+            self.eye_fbo[half].color_attachments[0].use(0)
+            self.fill_fbo[half].color_attachments[0].use(1)
+            self.edge_pack["mirror"].value = 1.0 if half == 0 else 0.0
+            self.edge_pack_vao.render(moderngl.TRIANGLES)
+        packed = self._preader.read()
+        if not bool(packed[..., 3].any()):
+            return False
+        self._nwriter.write(inpaint(packed))
+        return True
 
     # --- desktop compositing -------------------------------------------------
     def composite(self, windows):
@@ -771,48 +780,67 @@ class Renderer:
         ctx.viewport = (0, 0, self.dref_tex.size[0], self.dref_tex.size[1])
         self.gf_apply_vao.render(moderngl.TRIANGLES)
 
-    def set_depth(self, depth_np):
-        # depth_np is top-down (from a top-down frame); store v=1=top to match color.
-        # Adapt the texture to the backend's output size (mesh samples by UV).
-        h, w = depth_np.shape
-        if (w, h) != self.depth_tex.size:
-            self.depth_tex.release()
-            self.depth_tex = self.ctx.texture((w, h), 1, dtype="f4")
-            self.depth_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        d = np.ascontiguousarray(depth_np[::-1].astype("f4"))
-        self.depth_tex.write(d.tobytes())
+    def _float_tex(self, size, channels):
+        tex = self.ctx.texture(size, channels, dtype="f4")
+        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        tex.repeat_x = tex.repeat_y = False
+        return tex
 
-    # --- GL<->CUDA interop (zero-copy depth path) ---------------------------
-    def setup_interop(self, out_h, out_w):
-        """Wire the GL<->CUDA depth path: an RGBA8 downscale RT that CUDA reads as
-        the model input, and a depth texture (sized to the model output) that CUDA
-        writes into. Call on the GL thread after the backend is built; re-call if
-        the backend's output size changes. Raises if interop is unavailable."""
-        from .glcuda import GLTexReader, GLTexWriter
-        self.teardown_interop()
-        self.idsrc = self.ctx.framebuffer(
-            color_attachments=[self.ctx.texture((self.dw, self.dh), 4)])
-        self.idsrc.color_attachments[0].filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self._ireader = GLTexReader(self.idsrc.color_attachments[0].glo, self.dw, self.dh)
-        # depth texture fixed at the model output size; CUDA writes straight into it
+    # --- the depth pipeline's results ------------------------------------------
+    def attach_depth(self, depth_size, flow_size, flow_uv):
+        """Size the depth and flow textures to the depth pipeline's (h, w) sizes,
+        and wire the GL<->CUDA interop if it is available: an RGBA8 downscale RT
+        CUDA reads as the model input (depth_src_gl), and the textures CUDA
+        writes the results into (set_result). Call on the GL thread."""
+        self.release_depth()
         self.depth_tex.release()
-        self.depth_tex = self.ctx.texture((out_w, out_h), 1, dtype="f4")
-        self.depth_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self.depth_tex.write(np.full((out_h, out_w), 0.5, dtype="f4").tobytes())
-        self._iwriter = GLTexWriter(self.depth_tex.glo, out_w, out_h)
+        h, w = depth_size
+        fh, fw = flow_size
+        self.depth_tex = self._float_tex((w, h), 1)
+        self.depth_tex.write(np.full((h, w), 0.5, dtype="f4").tobytes())
+        self.flow_tex = [self._float_tex((fw, fh), 4) for _ in range(2)]
+        self.flow_uv = flow_uv
+        try:
+            from .glcuda import GLTexReader, GLTexWriter
+            self.idsrc = self.ctx.framebuffer(
+                color_attachments=[self.ctx.texture((self.dw, self.dh), 4)])
+            self.idsrc.color_attachments[0].filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self._ireader = GLTexReader(self.idsrc.color_attachments[0].glo, self.dw, self.dh)
+            self._iwriter = GLTexWriter(self.depth_tex.glo, w, h)
+            self._fwriters = [GLTexWriter(t.glo, fw, fh, channels=4) for t in self.flow_tex]
+        except Exception as e:
+            print(f"[braindance] GL<->CUDA interop unavailable, reading back: {e}", flush=True)
+            self._release_interop()
 
-    def teardown_interop(self):
-        for a in ("_ireader", "_iwriter"):
-            o = getattr(self, a, None)
+    def _release_interop(self):
+        for o in (self._ireader, self._iwriter, *self._fwriters):
             if o is not None:
                 o.close()
-                setattr(self, a, None)
+        self._ireader = self._iwriter = None
+        self._fwriters = [None, None]
         if self.idsrc is not None:
             self.idsrc.color_attachments[0].release()
             self.idsrc.release()
             self.idsrc = None
 
-    def depth_src_interop(self):
+    def release(self):
+        """Let go of everything CUDA holds of this renderer's textures."""
+        self.release_depth()
+        self._release_net()
+
+    def release_depth(self):
+        self._release_interop()
+        for tex in self.flow_tex:
+            if tex is not None:
+                tex.release()
+        self.flow_tex = [None, None]
+        self.has_flow = False
+
+    @property
+    def interop(self):
+        return self._iwriter is not None
+
+    def depth_src_gl(self):
         """Blit the work RT into the RGBA8 interop source and hand CUDA a GPU
         (H, W, 4) uint8 tensor of it — no readback. FBO order (row 0 = bottom)."""
         self.idsrc.use()
@@ -821,27 +849,46 @@ class Renderer:
         self.blit_vao.render(moderngl.TRIANGLES)
         return self._ireader.read()
 
-    def write_depth_interop(self, depth_hw):
-        """Copy a GPU (H, W) f32 depth straight into the GL depth texture."""
-        self._iwriter.write(depth_hw)
+    def set_result(self, r):
+        """Copy a depth.Pipeline result into the depth and flow textures. Its
+        tensors are top row first; the textures' row 0 is the bottom. None (the
+        pipeline had nothing new) keeps what they hold."""
+        if r is None:
+            return
+        if self.interop:
+            self._iwriter.write(r.depth.flip(0))
+            if r.flow is not None:
+                for eye in range(2):
+                    self._fwriters[eye].write(r.flow[eye].permute(1, 2, 0).flip(0))
+        else:
+            from .depth import to_numpy
+            self.depth_tex.write(to_numpy(r.depth.flip(0)).tobytes())
+            if r.flow is not None:
+                for eye in range(2):
+                    self.flow_tex[eye].write(to_numpy(r.flow[eye].permute(1, 2, 0).flip(0)).tobytes())
+        self.has_flow = r.flow is not None
 
     # --- present -------------------------------------------------------------
-    def draw(self, sbs_disp, zoom, panx, pany, pointer=None,
-             tear=False, tear_thresh=0.08, tear_fill="inpaint", sharp_mode="off",
+    def draw(self, sbs_disp, zoom, panx, pany, pointer=None, warp="mesh",
+             edge_fill="mirror", edge_cliff=4.0, edge_halo=6, inpaint=None, sharp_mode="off",
              jbu_color=0.5, jbu_reach=1.5, jbu_depth=0.0,
              gf_eps=0.01, gf_radius=4, climit_px=0.0, screen_depth_px=0.0,
-             tear_debug=False, depth_view="off"):
+             fill_debug=False, depth_view="off"):
         ctx = self.ctx
         disp_ndc = sbs_disp / (self.eye_w / 2.0)
         depth_mode = disp_ndc > 1e-6
-        # Tearing only makes sense with disparity (in FLAT it would punch holes in a
-        # flat image); sharpening also runs for the depth-debug views.
-        do_tear = tear and depth_mode
-        do_sharp = (sharp_mode != "off") and (depth_mode or depth_view != "off")
+        # The learned warp needs its offsets; until the first ones arrive (and in
+        # FLAT) the mesh draws. The edge fill and refining serve the mesh alone;
+        # in FLAT nothing stretches, so there is nothing to fill. Refining also
+        # runs for the depth-debug views.
+        use_mlbw = warp == "mlbw" and depth_mode and self.has_flow
+        mesh = warp == "mesh"
+        do_fill = edge_fill != "off" and depth_mode and mesh
+        do_sharp = (sharp_mode != "off") and (depth_mode or depth_view != "off") and mesh
 
         self.work.color_attachments[0].use(0)
-        # edge-aware depth refine -> dref_tex, so the warp samples crisp depth edges
-        # (which is what lets it tear cleanly). Two backends behind one slot.
+        # edge-aware depth refine -> dref_tex, so the warp samples crisp depth edges.
+        # Two backends behind one slot.
         if do_sharp and sharp_mode == "jbu":
             # color-guided joint-bilateral upsample (reach + color + depth terms).
             self._ensure_dref()
@@ -868,98 +915,103 @@ class Renderer:
 
         # Render into the supersampled RT when SSAA is on, then box-downsample to
         # the screen; otherwise draw straight to screen.
-        target = self.ss_fbo if self.ss_fbo is not None else ctx.screen
+        target = self.ss_fbo if self.ss_fbo is not None else self.screen
         target.use()
         s = self.ss
         ew, eh = int(round(self.eye_w * s)), int(round(self.ph * s))
 
         if depth_view == "2d":
             # flat debug: depth map (refined if SHARP MODE != off) as grayscale, both
-            # eyes identical. No warp, no tearing.
+            # eyes identical. No warp.
             ctx.clear(0.0, 0.0, 0.0)
             depth_src.use(0)
             for half in range(2):
                 ctx.viewport = (half * ew, 0, ew, eh)
                 self.depthview_vao.render(moderngl.TRIANGLES)
-        else:
-            # warp path — normal color, OR the 3D depth view (depth as grayscale,
-            # which still gets parallax + tearing + tear-debug). The geometry-shader
-            # warp is only needed for tearing; the no-tear path (common case) uses the
-            # GS-free twin to skip the per-triangle GS cost.
-            do_gs = do_tear
-            prog = self.warp if do_gs else self.warp_nogs
-            vao = self.warp_vao if do_gs else self.warp_nogs_vao
-            prog["show_depth"].value = 1.0 if depth_view == "3d" else 0.0
-            # tear-debug: torn gaps show bright magenta instead of the background fill
-            if do_tear and tear_debug:
-                ctx.clear(0.55, 0.0, 0.35)
-            else:
-                ctx.clear(0.0, 0.0, 0.0)
+        elif use_mlbw:
+            ctx.clear(0.0, 0.0, 0.0)
+            pan_ndc = (panx / self.eye_w * 2.0, -pany / self.ph * 2.0)
+            vshift_ndc = screen_depth_px / (self.eye_w / 2.0)
+            m = self.mlbw
+            m["uv_scale"].value = self.flow_uv
+            m["zoom"].value = zoom
+            m["pan"].value = pan_ndc
+            m["vshift"].value = vshift_ndc
+            m["climit"].value = climit_px / self.eye_w
+            m["show_depth"].value = 1.0 if depth_view == "3d" else 0.0
             self.work.color_attachments[0].use(0)
             depth_src.use(1)
+            for half in range(2):
+                ctx.viewport = (half * ew, 0, ew, eh)
+                self.flow_tex[half].use(2)
+                m["eye_sign"].value = 1.0 if half == 0 else -1.0
+                self.mlbw_vao.render(moderngl.TRIANGLES)
+            if pointer is not None and pointer[2] and depth_view == "off":
+                self._draw_cursor(pointer, disp_ndc, vshift_ndc, zoom, pan_ndc, ew, eh)
+        else:
+            # warp path — normal color, OR the 3D depth view (depth as grayscale,
+            # which still gets parallax and the edge fill). Each eye's mesh goes to
+            # its eye targets with the depth test, and the edge fill finds what to
+            # replace; then a blend brings each eye to the target with the mirror
+            # fill or the network's picture, or a blit does when the fill is off.
+            ctx.clear(0.0, 0.0, 0.0)
+            self._ensure_eye_rt(ew, eh)
+            prog = self.warp
+            prog["show_depth"].value = 1.0 if depth_view == "3d" else 0.0
             prog["zoom"].value = zoom
             pan_ndc = (panx / self.eye_w * 2.0, -pany / self.ph * 2.0)
             prog["pan"].value = pan_ndc
             prog["climit"].value = climit_px / (self.eye_w / 2.0)
             vshift_ndc = screen_depth_px / (self.eye_w / 2.0)
             prog["vshift"].value = vshift_ndc
-            # inpaint mode renders each eye's torn warp (real holes) into a per-eye
-            # RT, then fills the holes; other modes warp straight into the target.
-            inpaint_mode = do_tear and tear_fill == "inpaint" and not tear_debug
-            if inpaint_mode:
-                self._ensure_warp_rt(ew, eh)
+            prog["disp"].value = disp_ndc
+            prog["dtexel"].value = 1.0 / depth_src.size[0]
+            prog["src_px"].value = ew * zoom
+            # the fill's sizes are in present px; SSAA renders s times as many
+            self.edge_fill["texel"].value = (1.0 / ew, 1.0 / eh)
+            self.edge_fill["cliff_px"].value = float(edge_cliff) * s
+            self.edge_fill["feather"].value = 3.0 * s
+            self.edge_fill["halo"].value = int(round(edge_halo * s))
+            self.edge_mix["texel"].value = (1.0 / ew, 1.0 / eh)
             for half in range(2):
-                sign = 1.0 if half == 0 else -1.0
-                if inpaint_mode:
-                    # 1) warp this eye with tearing -> color + hole mask (alpha 0)
-                    self.warp_fbo.use()
-                    ctx.viewport = (0, 0, ew, eh)
-                    ctx.clear(0.0, 0.0, 0.0, 0.0)
-                    self.work.color_attachments[0].use(0)
-                    depth_src.use(1)
-                    prog["eye_sign"].value = sign
-                    prog["disp"].value = disp_ndc
-                    prog["fill"].value = 0
-                    prog["tear"].value = float(tear_thresh)
-                    vao.render(moderngl.TRIANGLES)
-                    # 2) inpaint holes -> fill RT (marks filled pixels a=0). Background
-                    # lies left for the left eye (eye_sign +1), right for the right eye.
-                    self.fill_fbo.use()
-                    ctx.viewport = (0, 0, ew, eh)
-                    self.warp_tex.use(0)
-                    self.inpaint["texel"].value = (1.0 / ew, 1.0 / eh)
-                    self.inpaint["dir"].value = -1.0 if half == 0 else 1.0
-                    self.inpaint_vao.render(moderngl.TRIANGLES)
-                    # 3) smooth just the filled pixels -> target eye viewport (breaks
-                    # up the horizontal streaks from 1-D continuation).
-                    target.use()
-                    ctx.viewport = (half * ew, 0, ew, eh)
-                    self.fill_tex.use(0)
-                    self.smooth["texel"].value = (1.0 / ew, 1.0 / eh)
-                    self.smooth_vao.render(moderngl.TRIANGLES)
-                    continue
+                col, msk = self.eye_fbo[half].color_attachments
+                self.eye_fbo[half].use()
+                ctx.clear(0.0, 0.0, 0.0, 0.0, depth=1.0)
+                ctx.enable(moderngl.DEPTH_TEST)
+                self.work.color_attachments[0].use(0)
+                depth_src.use(1)
+                prog["eye_sign"].value = 1.0 if half == 0 else -1.0
+                self.warp_vao.render(moderngl.TRIANGLES)
+                ctx.disable(moderngl.DEPTH_TEST)
+                if do_fill:
+                    self.fill_fbo[half].use()
+                    msk.use(0)
+                    col.use(1)
+                    self.edge_fill_vao.render(moderngl.TRIANGLES)
+            # the network paints both eyes at once, so it runs between the passes
+            source = 0.0
+            if fill_debug:
+                source = 2.0
+            elif do_fill and edge_fill == "network" and inpaint is not None:
+                source = 1.0 if self._paint(inpaint, ew, eh) else 0.0
+            self.edge_mix["source"].value = source
+            if source == 1.0:
+                self.net_tex.use(2)
+            target.use()
+            for half in range(2):
                 ctx.viewport = (half * ew, 0, ew, eh)
-                prog["eye_sign"].value = sign
-                prog["disp"].value = disp_ndc
-                if do_tear:
-                    if not tear_debug:                   # pass 1: fill behind the tear
-                        if tear_fill == "stretch":       # background-stretch the gap
-                            prog["fill"].value = 1
-                            prog["tear"].value = float(tear_thresh)
-                        else:                            # "ramp": legacy continuous
-                            prog["fill"].value = 0
-                            prog["tear"].value = 1e9
-                        vao.render(moderngl.TRIANGLES)
-                    prog["fill"].value = 0               # pass 2: crisp torn foreground
-                    prog["tear"].value = float(tear_thresh)
-                    vao.render(moderngl.TRIANGLES)
+                self.eye_fbo[half].color_attachments[0].use(0)
+                if do_fill:
+                    self.fill_fbo[half].color_attachments[0].use(1)
+                    self.edge_mix["net_x"].value = (0.5, -0.5) if half == 0 else (0.5, 0.5)
+                    self.edge_mix_vao.render(moderngl.TRIANGLES)
                 else:
-                    vao.render(moderngl.TRIANGLES)       # GS-free warp: no fill/tear
+                    self.blit_vao.render(moderngl.TRIANGLES)
 
             if pointer is not None and pointer[2] and depth_view == "off":
                 self._draw_cursor(pointer, disp_ndc, vshift_ndc, zoom, pan_ndc, ew, eh)
         if self.ss_fbo is not None:
-            ctx.screen.use()
+            self.screen.use()
             ctx.viewport = (0, 0, self.pw, self.ph)
             self.ss_tex.use(0)
             self.resolve_vao.render(moderngl.TRIANGLES)
@@ -985,126 +1037,26 @@ class Renderer:
             self.cursor["halfsz"].value = (0.010, 0.010 * asp)
             self.cursor_vao.render(moderngl.TRIANGLES)
 
-    def draw_hud(self):
-        ctx = self.ctx
-        ctx.enable(moderngl.BLEND)
-        self.hud_tex.use(0)
+    def draw_panel(self, xy, t=0.0, appear=1.0, screen_depth_px=0.0, pointer=None):
+        """The settings panel in each eye with its top-left at `xy` (eye pixels),
+        floated a fixed amount in front of the scene: it rides the SCREEN DEPTH
+        plane slide, so it stays in front wherever the scene currently sits.
+        `pointer` (x, y in eye pixels) draws the cursor at the panel's depth,
+        where it is clicking."""
+        disp = PANEL_DISP + screen_depth_px / (self.eye_w / 2.0)
+        rect = panel.ndc((self.eye_w, self.ph), xy)
+        asp = self.aspect
         for half in range(2):
-            ctx.viewport = (half * self.eye_w, 0, self.eye_w, self.ph)
-            self.hud_vao.render(moderngl.TRIANGLES)
-        ctx.disable(moderngl.BLEND)
-
-    def set_hud(self, text):
-        img = Image.new("RGBA", (self.HUD_W, self.HUD_H), (0, 0, 0, 140))
-        ImageDraw.Draw(img).text((8, 8), text, font=self.font, fill=(120, 255, 140, 255))
-        self.hud_tex.write(np.asarray(img).tobytes())
-
-    # --- settings OSD panel --------------------------------------------------
-    # Night City palette (mirrors ~/Scripts/palette_cyberpunk.py + picker.py).
-    _PAL = {
-        "bg": (10, 4, 24, 232), "border": (255, 42, 109), "magenta": (255, 42, 109),
-        "cyan": (5, 217, 232), "yellow": (252, 238, 12), "lime": (204, 255, 0),
-        "violet": (185, 103, 255), "fg": (160, 168, 200), "fg_hi": (200, 208, 232),
-        "muted": (90, 74, 120), "error": (255, 0, 60),
-    }
-
-    def _val_color(self, row):
-        P = self._PAL
-        if not row["editable"]:
-            return P["muted"]
-        if row["kind"] == "bool":
-            return P["lime"] if row["value"] == "ON" else P["muted"]
-        if row["kind"] == "enum":
-            return P["cyan"]
-        return P["yellow"]
-
-    def set_panel(self, tab_names, tab_idx, rows, fps):
-        """Rebuild the OSD texture (only when something changes). Compact, tabbed,
-        single column — anchored bottom-right so it doesn't occlude the scene.
-          rows: current tab only — section {section:True,label} or
-                setting {section:False,label,value,kind,editable,selected}.
-        """
-        sig = (tab_idx, tuple(tab_names),
-               tuple((r.get("section", False), r.get("label"), r.get("value"),
-                      r.get("selected")) for r in rows), int(fps))
-        if sig == self._panel_sig:
-            return
-        self._panel_sig = sig
-        P = self._PAL
-        W, H = self.PANEL_W, self.PANEL_H
-        img = Image.new("RGBA", (W, H), P["bg"])
-        d = ImageDraw.Draw(img)
-        d.rectangle([0, 0, W - 1, H - 1], outline=P["border"], width=2)
-
-        pad = 28
-        # title
-        d.text((pad, 12), "BRAINDANCE", font=self.pfont_b, fill=P["magenta"])
-        tw = d.textlength("BRAINDANCE", font=self.pfont_b)
-        d.text((pad + tw + 14, 18), "v4.0-NC", font=self.pfont_s, fill=P["yellow"])
-
-        # tab strip
-        tx, ty = pad, 46
-        for i, name in enumerate(tab_names):
-            w = d.textlength(name, font=self.pfont) + 22
-            if i == tab_idx:
-                d.rectangle([tx, ty, tx + w, ty + 30], fill=(36, 24, 64, 255))
-                d.rectangle([tx, ty + 28, tx + w, ty + 30], fill=P["magenta"])
-                d.text((tx + 11, ty + 4), name, font=self.pfont, fill=P["fg_hi"])
-            else:
-                d.text((tx + 11, ty + 4), name, font=self.pfont, fill=P["muted"])
-            tx += w + 5
-        d.line([pad, ty + 36, W - pad, ty + 36], fill=P["muted"], width=1)
-
-        # settings column (single, full panel width)
-        cw, lh = W - 2 * pad, 34
-        y = ty + 48
-        for r in rows:
-            if r.get("section"):
-                y += 6
-                d.rectangle([pad, y, pad + cw, y + 24], fill=(26, 16, 48, 255))
-                d.rectangle([pad, y, pad + 5, y + 24], fill=P["cyan"])
-                d.text((pad + 14, y + 1), r["label"], font=self.pfont_s, fill=P["cyan"])
-                y += 24 + 6
+            sign = 1.0 if half == 0 else -1.0
+            self.ctx.viewport = (half * self.eye_w, 0, self.eye_w, self.ph)
+            self.panel.draw(rect, t, appear, sign * disp)
+            if pointer is None:
                 continue
-            sel = r["selected"]
-            if sel:
-                d.rectangle([pad, y - 4, pad + cw, y + 26], fill=(36, 24, 64, 255))
-                d.rectangle([pad, y - 4, pad + 5, y + 26], fill=P["magenta"])
-            d.text((pad + 16, y), r["label"], font=self.pfont,
-                   fill=P["fg_hi"] if sel else P["fg"])
-            val = r["value"]
-            col = self._val_color(r)
-            vx = pad + cw - 150
-            if sel and r["editable"]:
-                d.text((vx - 22, y), "‹", font=self.pfont, fill=P["magenta"])
-                d.text((vx, y), val, font=self.pfont, fill=col)
-                w = d.textlength(val, font=self.pfont)
-                d.text((vx + w + 8, y), "›", font=self.pfont, fill=P["magenta"])
-            else:
-                d.text((vx, y), val, font=self.pfont, fill=col)
-            y += lh
-
-        # footer
-        d.line([pad, H - 44, W - pad, H - 44], fill=P["muted"], width=1)
-        fcol = P["lime"] if fps >= 55 else P["yellow"] if fps >= 30 else P["error"]
-        d.text((pad, H - 34), "FPS", font=self.pfont_s, fill=P["fg"])
-        d.text((pad + 46, H - 34), f"{fps:.0f}", font=self.pfont_s, fill=fcol)
-        d.text((W - 300, H - 34), "↑↓ ←→   ⇆ tab   ⏎ close",
-               font=self.pfont_s, fill=P["muted"])
-        self.panel_tex.write(np.asarray(img).tobytes())
-
-    def draw_panel(self, t=0.0, appear=1.0, screen_depth_px=0.0):
-        ctx = self.ctx
-        ctx.enable(moderngl.BLEND)
-        self.panel["time"].value = float(t)
-        self.panel["appear"].value = float(appear)
-        self.panel_tex.use(0)
-        # ride the SCREEN DEPTH plane slide so the panel floats a fixed amount in
-        # front of the scene wherever the scene currently sits (not a fixed depth).
-        vshift_ndc = screen_depth_px / (self.eye_w / 2.0)
-        disp = self.panel_disp + vshift_ndc
-        for half in range(2):
-            ctx.viewport = (half * self.eye_w, 0, self.eye_w, self.ph)
-            self.panel["off"].value = ((1.0 if half == 0 else -1.0) * disp, 0.0)
-            self.panel_vao.render(moderngl.TRIANGLES)
-        ctx.disable(moderngl.BLEND)
+            center = (pointer[0] / self.eye_w * 2 - 1 + sign * disp, 1 - pointer[1] / self.ph * 2)
+            self.cursor["center"].value = center
+            self.cursor["col"].value = (0.0, 0.0, 0.0)
+            self.cursor["halfsz"].value = (0.013, 0.013 * asp)
+            self.cursor_vao.render(moderngl.TRIANGLES)
+            self.cursor["col"].value = (1.0, 0.16, 0.43)
+            self.cursor["halfsz"].value = (0.010, 0.010 * asp)
+            self.cursor_vao.render(moderngl.TRIANGLES)
