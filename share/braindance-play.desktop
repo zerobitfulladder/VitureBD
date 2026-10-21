@@ -1,0 +1,13 @@
+# Opens 3D videos on the VITURE glasses with braindance: in the running session,
+# or in a new one. Install it for your file manager's "Open with" from the repo
+# root (after `uv sync`):
+#   sed "s|@REPO@|$PWD|" share/braindance-play.desktop > ~/.local/share/applications/braindance-play.desktop
+[Desktop Entry]
+Type=Application
+Name=braindance (3D on the glasses)
+Comment=Play a 3D side-by-side video on the VITURE glasses
+Exec=@REPO@/.venv/bin/braindance play %f
+Terminal=false
+NoDisplay=true
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;
+Categories=AudioVideo;Video;Player;
